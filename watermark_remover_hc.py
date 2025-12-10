@@ -370,7 +370,7 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                 except: pass
 
 # ----------------------------
-# Threading & UI Logic (NO CHANGES TO LOGIC)
+# Threading & UI Logic (Minimal UI Changes)
 # ----------------------------
 
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
@@ -379,7 +379,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
         widget.state(['disabled'])
     
     progress_bar['value'] = 0
-    status_label.config(text="Initializing...", foreground="blue")
+    status_label.config(text="Initializing...", foreground="#0056b3")
 
     watermark = watermark_entry.get()
     quality = int(quality_scale.get()) if compress_var.get() else 100
@@ -470,8 +470,8 @@ def paste_from_clipboard():
         if text:
             watermark_entry.delete(0, tk.END)
             watermark_entry.insert(0, text)
-            status_label.config(text="Text pasted", foreground="green")
-            root.after(1500, lambda: status_label.config(text="Ready", foreground="black"))
+            status_label.config(text="Text pasted from clipboard", foreground="green")
+            root.after(1500, lambda: status_label.config(text="Ready", foreground="gray"))
     except: pass
 
 def update_scale_label(val):
@@ -481,106 +481,95 @@ def toggle_compression():
     if compress_var.get():
         quality_scale.state(['!disabled'])
         compression_mode_dropdown.state(['!disabled'])
-        compression_mode_dropdown.config(state="readonly") 
+        compression_mode_dropdown.config(state="readonly") # Prevent typing
         grayscale_check.state(['!disabled'])
     else:
         quality_scale.state(['disabled'])
-        compression_mode_dropdown.state(['disabled']) 
+        compression_mode_dropdown.state(['disabled']) # Fully disabled
         grayscale_check.state(['disabled'])
 
 # ----------------------------
-# NATIVE UI SETUP (High DPI & Native Theme)
+# Enhanced GUI Setup
 # ----------------------------
 
-# 1. Enable High DPI Awareness (Windows)
-try:
-    from ctypes import windll
-    windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    pass
-
 root = tk.Tk()
-root.title("CleanPDF Utility")
-root.geometry("520x680")
-root.minsize(520, 680)
+root.title("CleanPDF")
+root.geometry("500x620")
+root.minsize(500, 620)
 
-# 2. Native Theme Selection
+# 1. Styling
 style = ttk.Style()
-current_theme = style.theme_use()
-if 'vista' in style.theme_names():
-    style.theme_use('vista')  # Windows Native
-elif 'aqua' in style.theme_names():
-    style.theme_use('aqua')   # macOS Native
-else:
-    style.theme_use('clam')   # Linux / Fallback
+style.theme_use('clam')
 
-# 3. Fonts and Spacing
-HEADER_FONT = ("Segoe UI", 12, "bold") if os.name == 'nt' else ("Helvetica", 14, "bold")
-NORMAL_FONT = ("Segoe UI", 9) if os.name == 'nt' else ("Helvetica", 11)
-SMALL_FONT = ("Segoe UI", 8) if os.name == 'nt' else ("Helvetica", 10)
+# Colors
+BG_COLOR = "#ffffff"
+FG_COLOR = "#333333"
+ACCENT_COLOR = "#0066cc" # Nice Blue
+ACCENT_HOVER = "#0052a3"
 
-# Global Padding
-PAD_X = 15
-PAD_Y = 10
+style.configure(".", background=BG_COLOR, foreground=FG_COLOR, font=("Segoe UI", 10))
+style.configure("TFrame", background=BG_COLOR)
+style.configure("TLabelframe", background=BG_COLOR, padding=15)
+style.configure("TLabelframe.Label", background=BG_COLOR, foreground="#666666", font=("Segoe UI", 9, "bold"))
 
-# Main Container
-main_frame = ttk.Frame(root, padding=20)
-main_frame.pack(fill=tk.BOTH, expand=True)
+# Button Styles
+style.configure("TButton", padding=6, relief="flat", background="#e1e1e1", borderwidth=0)
+style.map("TButton", background=[('active', '#d4d4d4')])
 
-# --- Header Section ---
-header_frame = ttk.Frame(main_frame)
+style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="white", font=("Segoe UI", 10, "bold"))
+style.map("Accent.TButton", background=[('active', ACCENT_HOVER)])
+
+# 2. Layout
+main_container = ttk.Frame(root, padding=20)
+main_container.pack(fill=tk.BOTH, expand=True)
+
+# Header
+header_frame = ttk.Frame(main_container)
 header_frame.pack(fill=tk.X, pady=(0, 20))
-
-title_lbl = ttk.Label(header_frame, text="CleanPDF Optimizer", font=HEADER_FONT)
-title_lbl.pack(side=tk.LEFT)
-
-status_label = ttk.Label(header_frame, text="Ready", font=SMALL_FONT, foreground="gray")
+ttk.Label(header_frame, text="PDF Optimizer", font=("Segoe UI", 16, "bold"), foreground=FG_COLOR).pack(side=tk.LEFT)
+status_label = ttk.Label(header_frame, text="Ready", foreground="gray", font=("Segoe UI", 9))
 status_label.pack(side=tk.RIGHT, anchor="s")
 
-# --- File Selection Section ---
-files_frame = ttk.LabelFrame(main_frame, text="Files & Filters", padding=PAD_X)
-files_frame.pack(fill=tk.X, pady=(0, PAD_Y))
-files_frame.columnconfigure(1, weight=1)
+# Section 1: Files & Watermark
+file_frame = ttk.LabelFrame(main_container, text="Configuration", padding=(15, 10))
+file_frame.pack(fill=tk.X, pady=(0, 15))
 
 # Input
-ttk.Label(files_frame, text="Input PDF:", font=NORMAL_FONT).grid(row=0, column=0, sticky="w", pady=5)
-input_entry = ttk.Entry(files_frame)
-input_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=5)
-browse_button = ttk.Button(files_frame, text="Browse", command=open_file)
-browse_button.grid(row=0, column=2, sticky="e", pady=5)
+ttk.Label(file_frame, text="Input File:").grid(row=0, column=0, sticky="w", pady=5)
+input_entry = ttk.Entry(file_frame)
+input_entry.grid(row=0, column=1, sticky="ew", padx=5)
+browse_button = ttk.Button(file_frame, text="...", width=4, command=open_file)
+browse_button.grid(row=0, column=2, sticky="e")
 
 # Output
-ttk.Label(files_frame, text="Save As:", font=NORMAL_FONT).grid(row=1, column=0, sticky="w", pady=5)
-output_entry = ttk.Entry(files_frame)
-output_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=5, columnspan=2)
-
-# Separator
-ttk.Separator(files_frame, orient='horizontal').grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
+ttk.Label(file_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=5)
+output_entry = ttk.Entry(file_frame)
+output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=2)
 
 # Watermark
-ttk.Label(files_frame, text="Remove Text:", font=NORMAL_FONT).grid(row=3, column=0, sticky="w", pady=5)
-watermark_entry = ttk.Entry(files_frame)
+ttk.Label(file_frame, text="Watermark:").grid(row=2, column=0, sticky="w", pady=5)
+watermark_entry = ttk.Entry(file_frame)
 watermark_entry.insert(0, "watermark")
-watermark_entry.grid(row=3, column=1, sticky="ew", padx=10, pady=5)
-paste_button = ttk.Button(files_frame, text="Paste", command=paste_from_clipboard)
-paste_button.grid(row=3, column=2, sticky="e", pady=5)
+watermark_entry.grid(row=2, column=1, sticky="ew", padx=5)
+paste_button = ttk.Button(file_frame, text="Paste", width=6, command=paste_from_clipboard)
+paste_button.grid(row=2, column=2, sticky="e")
 
-# --- Optimization Section ---
-opt_frame = ttk.LabelFrame(main_frame, text="Compression Settings", padding=PAD_X)
-opt_frame.pack(fill=tk.X, pady=(0, PAD_Y))
+file_frame.columnconfigure(1, weight=1)
+
+# Section 2: Optimization Settings
+opt_frame = ttk.LabelFrame(main_container, text="Optimization", padding=(15, 10))
+opt_frame.pack(fill=tk.X, pady=(0, 15))
 
 compress_var = tk.BooleanVar(value=False)
-compress_check = ttk.Checkbutton(opt_frame, text="Enable Advanced Compression", variable=compress_var, command=toggle_compression)
+compress_check = ttk.Checkbutton(opt_frame, text="Enable Compression & Rasterization", variable=compress_var, command=toggle_compression)
 compress_check.pack(anchor="w", pady=(0, 10))
 
-# Inner settings container
-settings_container = ttk.Frame(opt_frame)
-settings_container.pack(fill=tk.X, padx=20)
+# Settings Container (Internal)
+settings_inner = ttk.Frame(opt_frame)
+settings_inner.pack(fill=tk.X, padx=10)
 
-# Mode
-ttk.Label(settings_container, text="Compression Mode:", font=NORMAL_FONT).pack(anchor="w", pady=(5, 2))
 compression_mode_var = tk.StringVar(value="Safe Compression")
-compression_mode_dropdown = ttk.Combobox(settings_container, textvariable=compression_mode_var, state="disabled",
+compression_mode_dropdown = ttk.Combobox(settings_inner, textvariable=compression_mode_var, state="disabled",
                                          values=[
                                              "Safe Compression", 
                                              "Aggressive Compression", 
@@ -590,40 +579,31 @@ compression_mode_dropdown = ttk.Combobox(settings_container, textvariable=compre
                                          ])
 compression_mode_dropdown.pack(fill=tk.X, pady=(0, 10))
 
-# Quality Scale
-quality_header_frame = ttk.Frame(settings_container)
-quality_header_frame.pack(fill=tk.X)
-ttk.Label(quality_header_frame, text="Image Quality:", font=NORMAL_FONT).pack(side=tk.LEFT)
 quality_label_var = tk.StringVar(value="Quality: 75%")
-ttk.Label(quality_header_frame, textvariable=quality_label_var, font=SMALL_FONT, foreground="gray").pack(side=tk.RIGHT)
-
-quality_scale = ttk.Scale(settings_container, from_=10, to=100, orient="horizontal", command=update_scale_label)
+ttk.Label(settings_inner, textvariable=quality_label_var, font=("Segoe UI", 9)).pack(anchor="w")
+quality_scale = ttk.Scale(settings_inner, from_=10, to=100, orient="horizontal", command=update_scale_label)
 quality_scale.set(75)
-quality_scale.pack(fill=tk.X, pady=(5, 10))
+quality_scale.pack(fill=tk.X, pady=(0, 10))
 quality_scale.state(['disabled'])
 
-# Grayscale
 grayscale_var = tk.BooleanVar(value=False)
-grayscale_check = ttk.Checkbutton(settings_container, text="Convert to Grayscale (Reduces size)", variable=grayscale_var, state='disabled')
+grayscale_check = ttk.Checkbutton(settings_inner, text="Convert to Grayscale", variable=grayscale_var, state='disabled')
 grayscale_check.pack(anchor="w")
 
-# --- Progress & Actions ---
-bottom_frame = ttk.Frame(main_frame)
-bottom_frame.pack(fill=tk.BOTH, expand=True, pady=(20, 0))
+# Section 3: Actions
+action_frame = ttk.Frame(main_container)
+action_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-progress_bar = ttk.Progressbar(bottom_frame, orient="horizontal", mode="determinate")
-progress_bar.pack(fill=tk.X, pady=(0, 20))
+progress_bar = ttk.Progressbar(action_frame, orient="horizontal", mode="determinate")
+progress_bar.pack(fill=tk.X, pady=(0, 15))
 
-# Action Buttons
-btn_frame = ttk.Frame(bottom_frame)
-btn_frame.pack(fill=tk.X)
-btn_frame.columnconfigure(0, weight=1)
-btn_frame.columnconfigure(1, weight=1)
+btn_grid = ttk.Frame(action_frame)
+btn_grid.pack(fill=tk.X)
 
-save_button = ttk.Button(btn_frame, text="Process Single File", command=run_single_file)
-save_button.grid(row=0, column=0, sticky="ew", padx=(0, 5), ipady=5)
+save_button = ttk.Button(btn_grid, text="Process Single File", style="Accent.TButton", command=run_single_file)
+save_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
-batch_button = ttk.Button(btn_frame, text="Batch Process Folder", command=run_batch)
-batch_button.grid(row=0, column=1, sticky="ew", padx=(5, 0), ipady=5)
+batch_button = ttk.Button(btn_grid, text="Batch Process", style="Accent.TButton", command=run_batch)
+batch_button.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
 
 root.mainloop()
