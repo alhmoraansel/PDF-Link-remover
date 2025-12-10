@@ -8,13 +8,13 @@ import shutil
 import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
-from PIL import Image
+from PIL import Image, ImageOps
 
 # Allow loading truncated images
 Image.LOAD_TRUNCATED_IMAGES = True
 
 # ----------------------------
-# Helper / Compression Utilities (NO CHANGES)
+# Helper / Compression Utilities
 # ----------------------------
 
 def is_filter(obj, name_str):
@@ -59,6 +59,27 @@ def flatten_alpha(pil_img, background_color=(255,255,255)):
         return pil_img.convert('RGB')
     return pil_img
 
+def resize_image(pil_img, max_dim=None):
+    """
+    Downscales an image if it exceeds the max_dimension, maintaining aspect ratio.
+    """
+    if not max_dim:
+        return pil_img
+    
+    width, height = pil_img.size
+    if width <= max_dim and height <= max_dim:
+        return pil_img
+
+    # Calculate new size
+    if width > height:
+        new_width = max_dim
+        new_height = int(height * (max_dim / width))
+    else:
+        new_height = max_dim
+        new_width = int(width * (max_dim / height))
+        
+    return pil_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
 def jpeg_bytes_from_pil(pil_img, quality, subsampling=None):
     buf = io.BytesIO()
     save_kwargs = {"format": "JPEG", "quality": int(quality), "optimize": True}
@@ -73,7 +94,7 @@ def png_bytes_from_pil(pil_img, optimize=True):
     return buf.getvalue()
 
 # ----------------------------
-# Rasterization Logic (NO CHANGES)
+# Rasterization Logic
 # ----------------------------
 
 def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False):
@@ -131,7 +152,7 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         return False, f"Rasterization failed: {e}"
 
 # ----------------------------
-# Main pipeline (NO CHANGES)
+# Main pipeline (UPDATED LOGIC)
 # ----------------------------
 
 def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, mode, grayscale, update_progress):
@@ -141,6 +162,7 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
     os.close(fd2)
 
     try:
+        # --- Step 1: Repair PDF ---
         try:
             pdf = pikepdf.open(input_path, allow_overwriting_input=True)
             pdf.save(temp_repaired, fix_metadata_version=True)
@@ -150,32 +172,36 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
 
         if update_progress: update_progress(20)
 
+        # --- Step 2: Clean Watermarks/Links (PyMuPDF) ---
         try:
             doc = fitz.open(temp_repaired)
             doc.set_metadata({})
 
             for page in doc:
+                # Remove Links
                 try:
                     for link in page.get_links():
                         page.delete_link(link)
-                except Exception: pass
+                except: pass
 
+                # Remove Annotations
                 try:
                     for annot in list(page.annots()):
                         if annot.type[0] == 1: 
                             page.delete_annot(annot)
-                except Exception: pass
+                except: pass
 
+                # Redact Text
                 if watermark_text:
                     try:
                         hits = page.search_for(watermark_text)
                         for rect in hits:
                             page.add_redact_annot(rect)
                         page.apply_redactions(images=0, graphics=0)
-                    except Exception: pass
+                    except: pass
 
                 try: page.clean_contents()
-                except Exception: pass
+                except: pass
 
             doc.save(temp_cleaned, garbage=4, deflate=True)
             doc.close()
@@ -184,7 +210,10 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
 
         if update_progress: update_progress(50)
 
-        if mode == 'rasterize' or mode == 'rasterize_fax':
+        # --- Step 3: Compression Logic ---
+        
+        # Branch A: Full Page Rasterization (The "Nuclear Option")
+        if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
             success, msg = rasterize_and_rebuild(temp_cleaned, output_path, quality_val, grayscale, fax_mode=is_fax)
             if not success:
@@ -193,168 +222,137 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
             if update_progress: update_progress(100)
             return True, f"Success ({'Fax Mode' if is_fax else 'Rasterized'})"
 
+        # Branch B: Object-based Image Replacement (Safe/Aggressive/Lossless)
         try:
             pdf = pikepdf.open(temp_cleaned)
-            pdf.docinfo.clear()
+            pdf.docinfo.clear() # Clear metadata
 
+            # Define max dimensions based on mode
+            # Aggressive limits images to 1500px (good for A4 reading)
+            max_dim = 1500 if mode == 'aggressive' else None
+
+            count = 0
             for obj in list(pdf.objects):
                 try:
+                    # Basic Validation: Must be an Image XObject
                     if not (isinstance(obj, pikepdf.Stream) and obj.get('/Subtype') == pikepdf.Name('/Image')):
                         continue
                     
-                    if '/DecodeParms' in obj:
-                        parms = obj['/DecodeParms']
-                        if isinstance(parms, pikepdf.Dictionary):
-                            pred = parms.get('/Predictor', 1)
-                            if pred not in [1, 10]: continue 
-                    
-                    flt = obj.get('/Filter')
-                    if isinstance(flt, pikepdf.Array) and len(flt) > 1: continue 
-                    
-                    cs = obj.get('/ColorSpace')
-                    if isinstance(cs, pikepdf.Array) and cs[0] == pikepdf.Name('/Indexed'): continue 
-
+                    # Skip thumbnail masks or tiny bits
                     try:
-                        original_bytes = read_stream_bytes(obj) or b''
-                        original_size = len(original_bytes)
-                    except: original_size = 0
+                        if '/Width' in obj and int(obj['/Width']) < 50: continue
+                        if '/Height' in obj and int(obj['/Height']) < 50: continue
+                    except: pass
 
-                    is_jpx = (flt == pikepdf.Name('/JPXDecode') or (isinstance(flt, pikepdf.Array) and any(x == pikepdf.Name('/JPXDecode') for x in flt)))
-                    is_ccitt = (flt == pikepdf.Name('/CCITTFaxDecode') or (isinstance(flt, pikepdf.Array) and any(x == pikepdf.Name('/CCITTFaxDecode') for x in flt)))
-                    is_jbig2 = (flt == pikepdf.Name('/JBIG2Decode') or (isinstance(flt, pikepdf.Array) and any(x == pikepdf.Name('/JBIG2Decode') for x in flt)))
-                    is_ccitt_like = is_ccitt or is_jbig2
-
-                    try:
-                        width = int(obj.get('/Width', 0))
-                        height = int(obj.get('/Height', 0))
-                    except: width = height = 0
-
+                    # --- Extract Image ---
                     try:
                         pdf_img = PdfImage(obj)
                         pil_img = pil_from_pdfimage(pdf_img)
-                    except: continue
+                    except Exception:
+                        continue # Cannot decode, skip
 
-                    if width and height and (width < 20 or height < 20): continue
-                    if pil_img.width < 20 or pil_img.height < 20: continue
+                    # Capture original size
+                    try:
+                        original_bytes = read_stream_bytes(obj) or b''
+                        original_size = len(original_bytes)
+                    except: 
+                        original_size = 0
 
+                    # --- Mode Processing ---
+
+                    # 1. Grayscale Conversion
                     if grayscale and pil_img.mode != 'L':
                         pil_img = pil_img.convert('L')
 
-                    has_softmask = '/SMask' in obj
-                    has_mask = '/Mask' in obj
-                    pil_has_alpha = pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info)
+                    # 2. Downscaling (Crucial for compression)
+                    if max_dim:
+                        pil_img = resize_image(pil_img, max_dim)
 
-                    if mode == 'aggressive':
-                        if is_ccitt_like or is_jpx: continue
-                        pil_proc = flatten_alpha(pil_img)
-                        jpeg_bytes = jpeg_bytes_from_pil(pil_proc, quality_val, subsampling=2)
-                        if original_size and len(jpeg_bytes) > original_size * 1.5: continue
-                        try:
-                            try: obj.clear()
-                            except: pass
-                            obj.write(jpeg_bytes)
-                            obj['/Type'] = pikepdf.Name('/XObject')
-                            obj['/Subtype'] = pikepdf.Name('/Image')
-                            obj['/Width'] = pil_proc.width
-                            obj['/Height'] = pil_proc.height
-                            if grayscale:
-                                obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
-                            else:
-                                obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
-                            obj['/BitsPerComponent'] = 8
-                            obj['/Filter'] = pikepdf.Name('/DCTDecode')
-                            for k in ['/SMask', '/Mask', '/Decode', '/Matte', '/ColorKeyMask', '/ICCBased']:
-                                if k in obj:
-                                    try: del obj[k]
-                                    except: pass
-                            continue
-                        except: continue
+                    # 3. Encoding Logic
+                    new_data = None
+                    is_lossless = (mode == 'lossless-smart')
+                    
+                    # Handle Transparency
+                    has_alpha = pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info)
+                    
+                    # Logic: 
+                    # If Lossless -> Try PNG optimization
+                    # If Safe/Aggressive -> Flatten transparency and use JPEG
+                    
+                    if is_lossless:
+                        # Try Optimized PNG
+                        png_data = png_bytes_from_pil(pil_img, optimize=True)
+                        # We only accept if smaller
+                        if original_size == 0 or len(png_data) < original_size:
+                            new_data = png_data
+                            new_filter = pikepdf.Name('/FlateDecode')
+                            new_colorspace = pikepdf.Name('/DeviceRGB') if pil_img.mode == 'RGB' else pikepdf.Name('/DeviceGray')
+                    
+                    else: 
+                        # Safe OR Aggressive (Use JPEG)
+                        # Flatten alpha if present so we can use JPEG
+                        if has_alpha:
+                            pil_img = flatten_alpha(pil_img)
+                        
+                        # Ensure RGB or L for JPEG
+                        if pil_img.mode not in ('RGB', 'L'):
+                            pil_img = pil_img.convert('RGB')
 
-                    if mode == 'safe':
-                        if is_ccitt_like or is_jpx: continue
-                        if has_softmask or has_mask or pil_has_alpha: continue
-                        try:
-                            if pil_img.mode not in ('RGB', 'L'):
-                                pil_img = pil_img.convert('RGB')
-                            jpeg_bytes = jpeg_bytes_from_pil(pil_img, quality_val)
-                            if original_size and len(jpeg_bytes) >= original_size: continue
-                            try: obj.clear()
-                            except: pass
-                            obj.write(jpeg_bytes)
-                            obj['/Type'] = pikepdf.Name('/XObject')
-                            obj['/Subtype'] = pikepdf.Name('/Image')
-                            obj['/Width'] = pil_img.width
-                            obj['/Height'] = pil_img.height
-                            if grayscale or pil_img.mode == 'L':
-                                obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
-                            else:
-                                obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
-                            obj['/BitsPerComponent'] = 8
-                            obj['/Filter'] = pikepdf.Name('/DCTDecode')
-                            for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
-                                if k in obj:
-                                    try: del obj[k]
-                                    except: pass
-                            cs = obj.get('/ColorSpace')
-                            if isinstance(cs, pikepdf.Array) and len(cs) > 0 and cs[0] == pikepdf.Name('/ICCBased'):
-                                if grayscale: obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
-                                else: obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
-                            continue
-                        except: continue
+                        # Generate JPEG
+                        # Aggressive: Lower subsampling, slightly lower quality scaling
+                        q = quality_val
+                        sub = 0 if mode == 'safe' else 2 # 2 is 4:2:0 subsampling (smaller)
+                        
+                        jpeg_data = jpeg_bytes_from_pil(pil_img, q, subsampling=sub)
+                        
+                        # Accept logic:
+                        # If original_size is unknown -> Accept
+                        # If smaller -> Accept
+                        # If Aggressive -> Accept even if size is roughly same (because we might have standardized the format)
+                        accept_change = False
+                        if original_size == 0: accept_change = True
+                        elif len(jpeg_data) < original_size: accept_change = True
+                        elif mode == 'aggressive': 
+                             # Allow a 10% margin if we cleaned up a messy format
+                            if len(jpeg_data) < original_size * 1.1:
+                                accept_change = True
+                        
+                        if accept_change:
+                            new_data = jpeg_data
+                            new_filter = pikepdf.Name('/DCTDecode') # JPEG standard
+                            new_colorspace = pikepdf.Name('/DeviceRGB') if pil_img.mode == 'RGB' else pikepdf.Name('/DeviceGray')
 
-                    if mode == 'lossless-smart':
-                        if is_ccitt_like or is_jpx: continue
-                        if has_softmask or has_mask or pil_has_alpha:
-                            png_bytes = png_bytes_from_pil(pil_img)
-                            if original_size and len(png_bytes) >= original_size: continue
-                            try:
-                                try: obj.clear()
+                    # --- Write Changes ---
+                    if new_data:
+                        obj.clear()
+                        obj.write(new_data)
+                        obj['/Type'] = pikepdf.Name('/XObject')
+                        obj['/Subtype'] = pikepdf.Name('/Image')
+                        obj['/Width'] = pil_img.width
+                        obj['/Height'] = pil_img.height
+                        obj['/ColorSpace'] = new_colorspace
+                        obj['/BitsPerComponent'] = 8
+                        obj['/Filter'] = new_filter
+                        
+                        # Clean up old masking/decoding params that might conflict
+                        for k in ['/Decode', '/Mask', '/SMask', '/Matte', '/ColorKeyMask', '/DecodeParms']:
+                            if k in obj:
+                                try: del obj[k]
                                 except: pass
-                                obj.write(png_bytes)
-                                obj['/Type'] = pikepdf.Name('/XObject')
-                                obj['/Subtype'] = pikepdf.Name('/Image')
-                                obj['/Width'] = pil_img.width
-                                obj['/Height'] = pil_img.height
-                                obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
-                                obj['/BitsPerComponent'] = 8
-                                for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
-                                    if k in obj:
-                                        try: del obj[k]
-                                        except: pass
-                                continue
-                            except: continue
-                        try:
-                            if pil_img.mode not in ('RGB', 'L'): pil_img = pil_img.convert('RGB')
-                            jpeg_bytes = jpeg_bytes_from_pil(pil_img, quality_val)
-                            if original_size and len(jpeg_bytes) >= original_size: continue
-                            try:
-                                try: obj.clear()
-                                except: pass
-                                obj.write(jpeg_bytes)
-                                obj['/Type'] = pikepdf.Name('/XObject')
-                                obj['/Subtype'] = pikepdf.Name('/Image')
-                                obj['/Width'] = pil_img.width
-                                obj['/Height'] = pil_img.height
-                                if grayscale or pil_img.mode == 'L':
-                                    obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
-                                else:
-                                    obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
-                                obj['/BitsPerComponent'] = 8
-                                obj['/Filter'] = pikepdf.Name('/DCTDecode')
-                                for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
-                                    if k in obj:
-                                        try: del obj[k]
-                                        except: pass
-                                continue
-                            except: continue
-                        except: continue
-                except Exception:
+                        
+                        count += 1
+                        
+                except Exception as e:
+                    # print(f"Error processing image: {e}") 
                     continue
-            pdf.save(output_path)
+
+            # Save with object stream linearizing
+            pdf.save(output_path, object_stream_mode=pikepdf.ObjectStreamMode.generate)
             pdf.close()
+            
         except Exception as e:
             shutil.copy2(temp_cleaned, output_path)
-            return True, "Success (Compression skipped)"
+            return True, f"Success (Compression skipped: {e})"
 
         if update_progress:
             update_progress(100)
@@ -370,7 +368,7 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                 except: pass
 
 # ----------------------------
-# Threading & UI Logic (Minimal UI Changes)
+# Threading & UI Logic
 # ----------------------------
 
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
@@ -382,6 +380,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     status_label.config(text="Initializing...", foreground="#0056b3")
 
     watermark = watermark_entry.get()
+    # If compression is disabled, set quality to 100 to avoid degradation if rasterization is forced
     quality = int(quality_scale.get()) if compress_var.get() else 100
     grayscale = grayscale_var.get()
 
@@ -489,7 +488,7 @@ def toggle_compression():
         grayscale_check.state(['disabled'])
 
 # ----------------------------
-# Enhanced GUI Setup
+# GUI Setup
 # ----------------------------
 
 root = tk.Tk()

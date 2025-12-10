@@ -243,15 +243,18 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                     has_softmask = '/SMask' in obj
                     has_mask = '/Mask' in obj
                     pil_has_alpha = pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info)
-
                     if mode == 'aggressive':
-                        if is_ccitt_like or is_jpx: continue
+                        if is_ccitt_like or is_jpx:
+                            continue
                         pil_proc = flatten_alpha(pil_img)
                         jpeg_bytes = jpeg_bytes_from_pil(pil_proc, quality_val, subsampling=2)
-                        if original_size and len(jpeg_bytes) > original_size * 1.5: continue
+                        if original_size and len(jpeg_bytes) > original_size * 1.5:
+                            continue
                         try:
-                            try: obj.clear()
-                            except: pass
+                            try:
+                                obj.clear()
+                            except:
+                                pass
                             obj.write(jpeg_bytes)
                             obj['/Type'] = pikepdf.Name('/XObject')
                             obj['/Subtype'] = pikepdf.Name('/Image')
@@ -265,21 +268,29 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                             obj['/Filter'] = pikepdf.Name('/DCTDecode')
                             for k in ['/SMask', '/Mask', '/Decode', '/Matte', '/ColorKeyMask', '/ICCBased']:
                                 if k in obj:
-                                    try: del obj[k]
-                                    except: pass
+                                    try:
+                                        del obj[k]
+                                    except:
+                                        pass
                             continue
-                        except: continue
+                        except:
+                            continue
 
-                    if mode == 'safe':
-                        if is_ccitt_like or is_jpx: continue
-                        if has_softmask or has_mask or pil_has_alpha: continue
+                    elif mode == 'safe':
+                        if is_ccitt_like or is_jpx:
+                            continue
+                        if has_softmask or has_mask or pil_has_alpha:
+                            continue
                         try:
                             if pil_img.mode not in ('RGB', 'L'):
                                 pil_img = pil_img.convert('RGB')
                             jpeg_bytes = jpeg_bytes_from_pil(pil_img, quality_val)
-                            if original_size and len(jpeg_bytes) >= original_size: continue
-                            try: obj.clear()
-                            except: pass
+                            if original_size and len(jpeg_bytes) >= original_size:
+                                continue
+                            try:
+                                obj.clear()
+                            except:
+                                pass
                             obj.write(jpeg_bytes)
                             obj['/Type'] = pikepdf.Name('/XObject')
                             obj['/Subtype'] = pikepdf.Name('/Image')
@@ -293,23 +304,32 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                             obj['/Filter'] = pikepdf.Name('/DCTDecode')
                             for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
                                 if k in obj:
-                                    try: del obj[k]
-                                    except: pass
+                                    try:
+                                        del obj[k]
+                                    except:
+                                        pass
                             cs = obj.get('/ColorSpace')
                             if isinstance(cs, pikepdf.Array) and len(cs) > 0 and cs[0] == pikepdf.Name('/ICCBased'):
-                                if grayscale: obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
-                                else: obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
+                                if grayscale:
+                                    obj['/ColorSpace'] = pikepdf.Name('/DeviceGray')
+                                else:
+                                    obj['/ColorSpace'] = pikepdf.Name('/DeviceRGB')
                             continue
-                        except: continue
+                        except:
+                            continue
 
-                    if mode == 'lossless-smart':
-                        if is_ccitt_like or is_jpx: continue
+                    elif mode == 'lossless-smart':
+                        if is_ccitt_like or is_jpx:
+                            continue
                         if has_softmask or has_mask or pil_has_alpha:
                             png_bytes = png_bytes_from_pil(pil_img)
-                            if original_size and len(png_bytes) >= original_size: continue
+                            if original_size and len(png_bytes) >= original_size:
+                                continue
                             try:
-                                try: obj.clear()
-                                except: pass
+                                try:
+                                    obj.clear()
+                                except:
+                                    pass
                                 obj.write(png_bytes)
                                 obj['/Type'] = pikepdf.Name('/XObject')
                                 obj['/Subtype'] = pikepdf.Name('/Image')
@@ -319,17 +339,24 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                                 obj['/BitsPerComponent'] = 8
                                 for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
                                     if k in obj:
-                                        try: del obj[k]
-                                        except: pass
+                                        try:
+                                            del obj[k]
+                                        except:
+                                            pass
                                 continue
-                            except: continue
+                            except:
+                                continue
                         try:
-                            if pil_img.mode not in ('RGB', 'L'): pil_img = pil_img.convert('RGB')
+                            if pil_img.mode not in ('RGB', 'L'):
+                                pil_img = pil_img.convert('RGB')
                             jpeg_bytes = jpeg_bytes_from_pil(pil_img, quality_val)
-                            if original_size and len(jpeg_bytes) >= original_size: continue
+                            if original_size and len(jpeg_bytes) >= original_size:
+                                continue
                             try:
-                                try: obj.clear()
-                                except: pass
+                                try:
+                                    obj.clear()
+                                except:
+                                    pass
                                 obj.write(jpeg_bytes)
                                 obj['/Type'] = pikepdf.Name('/XObject')
                                 obj['/Subtype'] = pikepdf.Name('/Image')
@@ -343,11 +370,16 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                                 obj['/Filter'] = pikepdf.Name('/DCTDecode')
                                 for k in ['/Decode', '/Mask', '/Matte', '/ColorKeyMask']:
                                     if k in obj:
-                                        try: del obj[k]
-                                        except: pass
+                                        try:
+                                            del obj[k]
+                                        except:
+                                            pass
                                 continue
-                            except: continue
-                        except: continue
+                            except:
+                                continue
+                        except:
+                            continue
+
                 except Exception:
                     continue
             pdf.save(output_path)
