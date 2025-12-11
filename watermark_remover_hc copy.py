@@ -12,7 +12,6 @@ from pikepdf import Name, Dictionary, Array
 from PIL import Image, ImageOps
 import concurrent.futures
 import multiprocessing
-import queue  # Standard queue for polling
 
 # Allow loading truncated images
 Image.LOAD_TRUNCATED_IMAGES = True
@@ -100,9 +99,7 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
 
         mat = fitz.Matrix(zoom, zoom)
 
-        total_pages = len(src_doc)
-        
-        for i, page in enumerate(src_doc):
+        for page in src_doc:
             pix = page.get_pixmap(matrix=mat, alpha=False)
             mode = "RGB"
             if pix.n == 1: mode = "L"
@@ -144,52 +141,11 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         return False, f"Rasterization failed: {e}"
 
 # ----------------------------
-# Page Walker Utilities
-# ----------------------------
-
-def yield_images_from_resources(resources, processed_oids):
-    """
-    Recursively find images in a resource dictionary (handling Form XObjects).
-    Yields valid image objects that haven't been processed yet.
-    """
-    if '/XObject' not in resources:
-        return
-
-    xobjs = resources['/XObject']
-    for name, xobj_ref in xobjs.items():
-        try:
-            xobj = xobj_ref # pikepdf auto-resolves
-            
-            # Avoid processing the same object twice (e.g. repeated logos)
-            # Use getattr(obj, 'objid', None) to be safe, though pikepdf objects usually have it.
-            oid = getattr(xobj, 'objid', None)
-            if oid is not None and oid in processed_oids:
-                continue
-            
-            subtype = xobj.get('/Subtype')
-            
-            if subtype == pikepdf.Name('/Image'):
-                if oid is not None:
-                    processed_oids.add(oid)
-                yield xobj
-                
-            elif subtype == pikepdf.Name('/Form'):
-                # Forms can contain other images. Recurse.
-                if oid is not None:
-                    processed_oids.add(oid) # Mark form as visited
-                
-                if '/Resources' in xobj:
-                    yield from yield_images_from_resources(xobj['/Resources'], processed_oids)
-        except Exception:
-            continue
-
-# ----------------------------
 # Main pipeline (Worker Function)
 # ----------------------------
 
 def process_pdf_pipeline(args):
-    # Added progress_queue to args for live feedback
-    input_path, output_path, quality_val, mode, grayscale, progress_queue = args
+    input_path, output_path, quality_val, mode, grayscale = args
     
     try:
         # --- Branch 1: Rasterization (Uses PyMuPDF/fitz) ---
@@ -216,160 +172,173 @@ def process_pdf_pipeline(args):
         if '/AA' in pdf.Root: del pdf.Root['/AA']
         if '/OpenAction' in pdf.Root: del pdf.Root['/OpenAction']
 
-        # 2. Image Compression / Optimization (PAGE BY PAGE)
+        # 2. Image Compression / Optimization
         max_dim = 1500 if mode == 'aggressive' else None
-        
-        total_pages = len(pdf.pages)
-        processed_oids = set() # Track object IDs to prevent double-processing shared images
 
-        # Iterate Page by Page for better progress tracking
-        for page_idx, page in enumerate(pdf.pages):
-            
-            # Report Progress
-            if progress_queue:
-                progress_queue.put(('progress', page_idx + 1, total_pages))
-
-            if '/Resources' not in page:
-                continue
-
-            # Use generator to find all images on this page (including nested ones)
-            # This logic avoids iterating the entire PDF object tree unnecessarily.
-            for obj in yield_images_from_resources(page['/Resources'], processed_oids):
-                try:
-                    # =========================================================
-                    # THE GATEKEEPER: STRICT SKIP LOGIC
-                    # =========================================================
-
-                    # 1. Check for Masks (Alpha/Stencil/Transparency)
-                    has_mask = False
-                    for k in ['/Mask', '/SMask', '/ImageMask', '/Matte']:
-                        if k in obj:
-                            has_mask = True
-                            break
-                    if has_mask:
-                        continue
-
-                    # 2. Check for Decode Arrays
-                    if '/Decode' in obj:
-                        continue
-
-                    # 3. Check for Dangerous ColorSpaces
-                    cs = obj.get('/ColorSpace')
-                    is_safe_cs = False
-                    if cs == pikepdf.Name('/DeviceRGB') or cs == pikepdf.Name('/DeviceGray'):
-                        is_safe_cs = True
-                    
-                    if not is_safe_cs:
-                        continue
-
-                    # 4. Check for 1-bit or Text Filters
-                    current_filter = obj.get('/Filter')
-                    if current_filter:
-                        filters = current_filter if isinstance(current_filter, list) else [current_filter]
-                        skip_filter = False
-                        for f in filters:
-                            if f in (pikepdf.Name('/CCITTFaxDecode'), pikepdf.Name('/JBIG2Decode'), pikepdf.Name('/JPXDecode')):
-                                skip_filter = True
-                                break
-                        if skip_filter:
-                            continue
-                    
-                    if obj.get('/BitsPerComponent') == 1:
-                        continue
-
-                    # =========================================================
-                    # EXTRACTION & PROCESSING
-                    # =========================================================
-
-                    img = pil_from_pdfimage(obj)
-                    if img is None:
-                        continue
-
-                    # 5. Last Line of Defense: PIL Mode Check
-                    if img.mode in ('1', 'CMYK', 'P'):
-                        continue
-                    
-                    if img.mode not in ('RGB', 'L'):
-                        continue
-
-                    # Capture original size
-                    original_compressed_size = get_raw_stream_length(obj)
-
-                    # Process Image
-                    if grayscale:
-                        if img.mode != "L":
-                            new_img = img.convert("L")
-                            new_mode = "DeviceGray"
-                        else:
-                            new_img = img
-                            new_mode = "DeviceGray"
-                    else:
-                        if img.mode == "L":
-                            new_img = img
-                            new_mode = "DeviceGray"
-                        else:
-                            new_img = img.convert("RGB")
-                            new_mode = "DeviceRGB"
-
-                    if max_dim:
-                        new_img = resize_image(new_img, max_dim)
-
-                    # Generate Candidate Stream
-                    new_data = None
-                    is_lossless = (mode == 'lossless-smart')
-                    
-                    # LOGIC UPDATE: User requested strict size guard. 
-                    # Only accept changes (including grayscale conversion) if the file size decreases.
-                    
-                    if is_lossless:
-                        buf = io.BytesIO()
-                        new_img.save(buf, format="PNG", optimize=True)
-                        temp_data = buf.getvalue()
-                        
-                        if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
-                            new_data = temp_data
-                            new_filter = pikepdf.Name("/FlateDecode")
-                    else:
-                        q = quality_val
-                        sub = 0 if mode == 'safe' else 2
-                        buf = io.BytesIO()
-                        new_img.save(buf, format="JPEG", quality=q, subsampling=sub, optimize=True)
-                        temp_data = buf.getvalue()
-                        
-                        if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
-                            new_data = temp_data
-                            new_filter = pikepdf.Name("/DCTDecode")
-
-                    # =========================================================
-                    # SCORCHED EARTH WRITER
-                    # =========================================================
-                    
-                    if new_data:
-                        obj.write(new_data, filter=new_filter)
-                        
-                        obj["/Type"] = pikepdf.Name("/XObject")
-                        obj["/Subtype"] = pikepdf.Name("/Image")
-                        obj["/Width"] = new_img.width
-                        obj["/Height"] = new_img.height
-                        obj["/ColorSpace"] = pikepdf.Name("/" + new_mode)
-                        obj["/BitsPerComponent"] = 8
-                        obj["/Length"] = len(new_data)
-                        
-                        current_keys = list(obj.keys())
-                        
-                        whitelist = {
-                            '/Type', '/Subtype', 
-                            '/Width', '/Height', 
-                            '/ColorSpace', '/BitsPerComponent', 
-                            '/Length', '/Filter'
-                        }
-
-                        for k in current_keys:
-                            if k not in whitelist:
-                                del obj[k]
-
-                except Exception as e:
+        for obj in list(pdf.objects):
+            try:
+                # Validation: Must be an Image XObject
+                if not (isinstance(obj, pikepdf.Stream) and obj.get('/Subtype') == pikepdf.Name('/Image')):
                     continue
+                
+                # =========================================================
+                # THE GATEKEEPER: STRICT SKIP LOGIC
+                # =========================================================
+
+                # 1. Check for Masks (Alpha/Stencil/Transparency)
+                # If these exist, we CANNOT simply replace the stream with a JPEG.
+                has_mask = False
+                for k in ['/Mask', '/SMask', '/ImageMask', '/Matte']:
+                    if k in obj:
+                        has_mask = True
+                        break
+                if has_mask:
+                    # print(f"[SKIP] Mask detected on object {obj.objid}")
+                    continue
+
+                # 2. Check for Decode Arrays
+                # If /Decode exists (e.g. [1 0] for inversion), we skip. 
+                # Converting to standard JPEG + removing Decode = Inverted Image (Black Box).
+                if '/Decode' in obj:
+                    # print(f"[SKIP] Decode array detected on object {obj.objid}")
+                    continue
+
+                # 3. Check for Dangerous ColorSpaces
+                # We only touch simple DeviceRGB or DeviceGray.
+                # ICCBased, Indexed, Separation, Lab, CMYK = SKIP.
+                cs = obj.get('/ColorSpace')
+                is_safe_cs = False
+                if cs == pikepdf.Name('/DeviceRGB') or cs == pikepdf.Name('/DeviceGray'):
+                    is_safe_cs = True
+                
+                if not is_safe_cs:
+                    # print(f"[SKIP] Unsafe ColorSpace {cs} on object {obj.objid}")
+                    continue
+
+                # 4. Check for 1-bit or Text Filters
+                # JBIG2/CCITT are for text. Converting to JPEG bloats size and ruins edge sharpness.
+                current_filter = obj.get('/Filter')
+                if current_filter:
+                    filters = current_filter if isinstance(current_filter, list) else [current_filter]
+                    skip_filter = False
+                    for f in filters:
+                        if f in (pikepdf.Name('/CCITTFaxDecode'), pikepdf.Name('/JBIG2Decode'), pikepdf.Name('/JPXDecode')):
+                            skip_filter = True
+                            break
+                    if skip_filter:
+                        # print(f"[SKIP] Text filter detected on object {obj.objid}")
+                        continue
+                
+                if obj.get('/BitsPerComponent') == 1:
+                    # print(f"[SKIP] 1-bit image detected on object {obj.objid}")
+                    continue
+
+                # =========================================================
+                # EXTRACTION & PROCESSING
+                # =========================================================
+
+                img = pil_from_pdfimage(obj)
+                if img is None:
+                    continue
+
+                # 5. Last Line of Defense: PIL Mode Check
+                # If PIL says it's 1-bit, CMYK, or Palette, we bail.
+                if img.mode in ('1', 'CMYK', 'P'):
+                    # print(f"[SKIP] Unsafe PIL Mode {img.mode} on object {obj.objid}")
+                    continue
+                
+                # Check safe modes
+                if img.mode not in ('RGB', 'L'):
+                    continue
+
+                # Capture original size
+                original_compressed_size = get_raw_stream_length(obj)
+
+                # Process Image
+                # Normalize to standard RGB or Grayscale
+                if grayscale:
+                     if img.mode != "L":
+                         new_img = img.convert("L")
+                         new_mode = "DeviceGray"
+                     else:
+                         new_img = img
+                         new_mode = "DeviceGray"
+                else:
+                    if img.mode == "L":
+                        new_img = img
+                        new_mode = "DeviceGray"
+                    else:
+                        new_img = img.convert("RGB")
+                        new_mode = "DeviceRGB"
+
+                if max_dim:
+                    new_img = resize_image(new_img, max_dim)
+
+                # Generate Candidate Stream
+                new_data = None
+                is_lossless = (mode == 'lossless-smart')
+                
+                if is_lossless:
+                     buf = io.BytesIO()
+                     new_img.save(buf, format="PNG", optimize=True)
+                     temp_data = buf.getvalue()
+                     # STRICT Size Check
+                     if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
+                         new_data = temp_data
+                         new_filter = pikepdf.Name("/FlateDecode")
+                else:
+                    q = quality_val
+                    sub = 0 if mode == 'safe' else 2
+                    buf = io.BytesIO()
+                    new_img.save(buf, format="JPEG", quality=q, subsampling=sub, optimize=True)
+                    temp_data = buf.getvalue()
+                    
+                    # STRICT Size Check
+                    if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
+                         new_data = temp_data
+                         new_filter = pikepdf.Name("/DCTDecode")
+
+                # =========================================================
+                # SCORCHED EARTH WRITER
+                # =========================================================
+                
+                if new_data:
+                    # We are replacing the stream. We must PURGE any metadata that might 
+                    # conflict with our new standard JPEG/PNG stream.
+                    
+                    # 1. Update the stream content
+                    obj.write(new_data, filter=new_filter)
+                    
+                    # 2. Define the new Valid Keys
+                    # These are the ONLY keys that should exist for a standard Image XObject
+                    obj["/Type"] = pikepdf.Name("/XObject")
+                    obj["/Subtype"] = pikepdf.Name("/Image")
+                    obj["/Width"] = new_img.width
+                    obj["/Height"] = new_img.height
+                    obj["/ColorSpace"] = pikepdf.Name("/" + new_mode)
+                    obj["/BitsPerComponent"] = 8
+                    obj["/Length"] = len(new_data)
+                    
+                    # 3. NUKE everything else
+                    # We iterate over a copy of keys to avoid modification issues
+                    current_keys = list(obj.keys())
+                    
+                    # Whitelist of keys we explicitly set or allow
+                    whitelist = {
+                        '/Type', '/Subtype', 
+                        '/Width', '/Height', 
+                        '/ColorSpace', '/BitsPerComponent', 
+                        '/Length', '/Filter'
+                    }
+
+                    for k in current_keys:
+                        if k not in whitelist:
+                            # print(f"[CLEAN] Removing key {k} from object {obj.objid}")
+                            del obj[k]
+
+            except Exception as e:
+                # print(f"[ERROR] {e}")
+                continue
 
         pdf.save(output_path, object_stream_mode=pikepdf.ObjectStreamMode.generate)
         pdf.close()
@@ -400,12 +369,6 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     elif mode_choice == "Rasterize (B&W Fax Mode)": mode = 'rasterize_fax'
     else: mode = 'lossless-smart'
 
-    # Setup Multiprocessing Queue for granular progress updates
-    use_granular_progress = (len(files_to_process) == 1)
-    
-    manager = multiprocessing.Manager()
-    progress_queue = manager.Queue() if use_granular_progress else None
-
     tasks = []
     for file_path in files_to_process:
         filename = os.path.basename(file_path)
@@ -415,35 +378,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
             name, ext = os.path.splitext(filename)
             current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
         
-        # Pass the queue to the worker
-        tasks.append((file_path, current_output, quality, mode, grayscale, progress_queue))
-
-    # Polling function for granular progress
-    def poll_queue():
-        if not progress_queue:
-            return
-            
-        try:
-            while True:
-                # Non-blocking check
-                msg = progress_queue.get_nowait()
-                msg_type = msg[0]
-                
-                if msg_type == 'progress':
-                    _, current, total = msg
-                    if total > 0:
-                        percent = (current / total) * 100
-                        progress_bar['value'] = percent
-                        status_label.config(text=f"Processing Page {current}/{total}")
-        except queue.Empty:
-            pass
-            
-        # Reschedule check
-        if save_button.instate(['disabled']): # Stop polling if UI is re-enabled (job done)
-            root.after(100, poll_queue)
-
-    if use_granular_progress:
-        root.after(100, poll_queue)
+        tasks.append((file_path, current_output, quality, mode, grayscale))
 
     def run_job():
         success_count = 0
@@ -469,12 +404,8 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
                     errors.append(f"{filename}: Exception: {exc}")
                 
                 completed += 1
-                
-                if not use_granular_progress:
-                    percentage = (completed / total_files) * 100
-                    root.after(0, lambda p=percentage, f=filename: update_ui_progress(p, f))
-                else:
-                    root.after(0, lambda f=filename: status_label.config(text=f"Finished: {f}"))
+                percentage = (completed / total_files) * 100
+                root.after(0, lambda p=percentage, f=filename: update_ui_progress(p, f))
 
         root.after(0, lambda: finish_processing(success_count, total_files, errors))
 
