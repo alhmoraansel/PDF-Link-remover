@@ -83,7 +83,7 @@ def png_bytes_from_pil(pil_img, optimize=True):
 # Rasterization Logic (Using PyMuPDF/fitz)
 # ----------------------------
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False):
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, progress_queue=None):
     """
     Uses PyMuPDF (fitz) to render pages as images and rebuild the PDF.
     This effectively flattens all layers, annotations, and vector graphics.
@@ -103,6 +103,10 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         total_pages = len(src_doc)
         
         for i, page in enumerate(src_doc):
+            # Update Progress
+            if progress_queue:
+                progress_queue.put(('progress', i + 1, total_pages))
+
             pix = page.get_pixmap(matrix=mat, alpha=False)
             mode = "RGB"
             if pix.n == 1: mode = "L"
@@ -195,7 +199,14 @@ def process_pdf_pipeline(args):
         # --- Branch 1: Rasterization (Uses PyMuPDF/fitz) ---
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
-            success, msg = rasterize_and_rebuild(input_path, output_path, quality_val, grayscale, fax_mode=is_fax)
+            success, msg = rasterize_and_rebuild(
+                input_path, 
+                output_path, 
+                quality_val, 
+                grayscale, 
+                fax_mode=is_fax,
+                progress_queue=progress_queue
+            )
             return success, msg
 
         # --- Branch 2: Structural Cleaning & Compression (Uses Pikepdf) ---
