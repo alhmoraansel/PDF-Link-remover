@@ -8,7 +8,11 @@ import shutil
 import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
+from pikepdf import Name, Dictionary, Array
 from PIL import Image, ImageOps
+import concurrent.futures
+import multiprocessing
+import queue  # Standard queue for polling
 
 # Allow loading truncated images
 Image.LOAD_TRUNCATED_IMAGES = True
@@ -17,52 +21,32 @@ Image.LOAD_TRUNCATED_IMAGES = True
 # Helper / Compression Utilities
 # ----------------------------
 
-def is_filter(obj, name_str):
+def get_raw_stream_length(obj):
+    """
+    Returns the actual compressed length of the stream on disk.
+    """
     try:
-        f = obj.get('/Filter')
-        return f == pikepdf.Name(name_str)
-    except Exception:
-        return False
-
-def read_stream_bytes(obj):
-    try:
-        return obj.get_stream_buffer()
-    except Exception:
+        if '/Length' in obj:
+            return int(obj['/Length'])
+    except:
         pass
     try:
-        return obj.read_bytes()
-    except Exception:
+        return len(obj.read_raw_bytes())
+    except:
         pass
-    return b''
+    return 0
 
-def pil_from_pdfimage(pdf_img):
-    pil_img = pdf_img.as_pil_image()
-    if pil_img.mode == 'CMYK':
-        pil_img = pil_img.convert('RGB')
-    if pil_img.mode == '1':
-        pil_img = pil_img.convert('L').convert('RGB')
-    return pil_img
-
-def flatten_alpha(pil_img, background_color=(255,255,255)):
-    if pil_img.mode in ('RGBA', 'LA'):
-        alpha = pil_img.split()[-1]
-        base = Image.new('RGB', pil_img.size, background_color)
-        base.paste(pil_img, mask=alpha)
-        return base
-    elif pil_img.mode == 'P' and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
-        alpha = pil_img.split()[-1]
-        base = Image.new('RGB', pil_img.size, background_color)
-        base.paste(pil_img, mask=alpha)
-        return base
-    elif pil_img.mode != 'RGB':
-        return pil_img.convert('RGB')
-    return pil_img
+def pil_from_pdfimage(obj):
+    """
+    Safely extract PIL image from PDF Image XObject.
+    """
+    try:
+        pdf_img = PdfImage(obj)
+        return pdf_img.as_pil_image()
+    except Exception:
+        return None
 
 def resize_image(pil_img, max_dim=None):
-    """
-    Downscales an image if it exceeds the max_dimension, maintaining aspect ratio.
-    """
     if not max_dim:
         return pil_img
     
@@ -70,7 +54,6 @@ def resize_image(pil_img, max_dim=None):
     if width <= max_dim and height <= max_dim:
         return pil_img
 
-    # Calculate new size
     if width > height:
         new_width = max_dim
         new_height = int(height * (max_dim / width))
@@ -93,11 +76,38 @@ def png_bytes_from_pil(pil_img, optimize=True):
     pil_img.save(buf, format="PNG", optimize=bool(optimize))
     return buf.getvalue()
 
+def flatten_alpha(pil_img, background_color=(255,255,255)):
+    if pil_img.mode in ('RGBA', 'LA'):
+        alpha = pil_img.split()[-1]
+        base = Image.new('RGB', pil_img.size, background_color)
+        base.paste(pil_img, mask=alpha)
+        return base
+    elif pil_img.mode == 'P' and 'transparency' in pil_img.info:
+        pil_img = pil_img.convert('RGBA')
+        alpha = pil_img.split()[-1]
+        base = Image.new('RGB', pil_img.size, background_color)
+        base.paste(pil_img, mask=alpha)
+        return base
+    elif pil_img.mode != 'RGB':
+        return pil_img.convert('RGB')
+    return pil_img
+
+def read_stream_bytes(obj):
+    try:
+        return obj.get_stream_buffer()
+    except Exception:
+        pass
+    try:
+        return obj.read_bytes()
+    except Exception:
+        pass
+    return b''
+
 # ----------------------------
 # Rasterization Logic
 # ----------------------------
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False):
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, progress_queue=None):
     try:
         src_doc = fitz.open(input_pdf_path)
         out_doc = fitz.open()
@@ -109,8 +119,12 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
             if zoom > 2.0: zoom = 2.0
 
         mat = fitz.Matrix(zoom, zoom)
+        total_pages = len(src_doc)
 
-        for page in src_doc:
+        for i, page in enumerate(src_doc):
+            if progress_queue:
+                progress_queue.put(('progress', i + 1, total_pages))
+
             pix = page.get_pixmap(matrix=mat, alpha=False)
             mode = "RGB"
             if pix.n == 1: mode = "L"
@@ -152,32 +166,49 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         return False, f"Rasterization failed: {e}"
 
 # ----------------------------
-# Main pipeline (UPDATED LOGIC)
+# Main Pipeline (Robust Repair -> Clean -> Compress)
 # ----------------------------
 
-def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, mode, grayscale, update_progress):
-    fd1, temp_repaired = tempfile.mkstemp(suffix=".pdf")
+def process_pdf_pipeline(args):
+    # Unpack arguments from threading wrapper
+    input_path, output_path, watermark_text, quality_val, mode, grayscale, progress_queue = args
+    
+    # Define temp file paths
+    fd1, temp_repaired = tempfile.mkstemp(suffix="_repaired.pdf")
     os.close(fd1)
-    fd2, temp_cleaned = tempfile.mkstemp(suffix=".pdf")
+    fd2, temp_cleaned = tempfile.mkstemp(suffix="_cleaned.pdf")
     os.close(fd2)
 
     try:
-        # --- Step 1: Repair PDF ---
+        if progress_queue:
+            progress_queue.put(('status', "Step 1/3: Repairing Structure...", 0))
+
+        # --- Step 1: Repair PDF (Pikepdf) ---
         try:
             pdf = pikepdf.open(input_path, allow_overwriting_input=True)
             pdf.save(temp_repaired, fix_metadata_version=True)
             pdf.close()
         except Exception as e:
-            return False, f"Repair failed: {e}"
-
-        if update_progress: update_progress(20)
+            shutil.copy2(input_path, temp_repaired)
 
         # --- Step 2: Clean Watermarks/Links (PyMuPDF) ---
+        if progress_queue:
+            progress_queue.put(('status', "Step 2/3: Cleaning Content...", 0))
+
         try:
             doc = fitz.open(temp_repaired)
-            doc.set_metadata({})
+            doc.set_metadata({}) 
+            total_pages = len(doc)
 
-            for page in doc:
+            phrases = []
+            if watermark_text and watermark_text.strip():
+                phrases = [p.strip() for p in watermark_text.split(',')]
+
+            for i, page in enumerate(doc):
+                # Optional: Update progress for cleaning massive docs
+                if i % 10 == 0 and progress_queue:
+                     progress_queue.put(('status', f"Cleaning Page {i+1}/{total_pages}...", 0))
+
                 # Remove Links
                 try:
                     for link in page.get_links():
@@ -192,11 +223,15 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                 except: pass
 
                 # Redact Text
-                if watermark_text:
+                if phrases:
                     try:
-                        hits = page.search_for(watermark_text)
-                        for rect in hits:
-                            page.add_redact_annot(rect)
+                        for phrase in phrases:
+                            if not phrase: continue
+                            hits = page.search_for(phrase)
+                            for rect in hits:
+                                page.add_redact_annot(rect)
+                        
+                        # REDACT FLAGS: images=0 (keep), graphics=0 (keep), text=1 (remove)
                         page.apply_redactions(images=0, graphics=0)
                     except: pass
 
@@ -205,124 +240,109 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
 
             doc.save(temp_cleaned, garbage=4, deflate=True)
             doc.close()
+            current_input = temp_cleaned
         except Exception as e:
-            return False, f"Cleaning failed: {e}"
-
-        if update_progress: update_progress(50)
-
-        # --- Step 3: Compression Logic ---
+            current_input = temp_repaired
         
-        # Branch A: Full Page Rasterization (The "Nuclear Option")
+        # --- Step 3: Compression / Rasterization ---
+        if progress_queue:
+            progress_queue.put(('status', "Step 3/3: Optimizing...", 0))
+
+        # Branch A: Rasterization
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
-            success, msg = rasterize_and_rebuild(temp_cleaned, output_path, quality_val, grayscale, fax_mode=is_fax)
-            if not success:
-                shutil.copy2(temp_cleaned, output_path)
-                return False, msg
-            if update_progress: update_progress(100)
-            return True, f"Success ({'Fax Mode' if is_fax else 'Rasterized'})"
+            success, msg = rasterize_and_rebuild(
+                current_input, 
+                output_path, 
+                quality_val, 
+                grayscale, 
+                fax_mode=is_fax,
+                progress_queue=progress_queue
+            )
+            return success, msg
 
-        # Branch B: Object-based Image Replacement (Safe/Aggressive/Lossless)
+        # Branch B: Object-based Optimization (Pikepdf)
         try:
-            pdf = pikepdf.open(temp_cleaned)
-            pdf.docinfo.clear() # Clear metadata
+            pdf = pikepdf.open(current_input, allow_overwriting_input=True)
+            pdf.docinfo.clear()
 
-            # Define max dimensions based on mode
-            # Aggressive limits images to 1500px (good for A4 reading)
+            # Clean Structure
+            try:
+                if '/Outlines' in pdf.Root: del pdf.Root['/Outlines']
+            except: pass
+            
+            # Iterate objects (Standard Pikepdf approach for max compression)
             max_dim = 1500 if mode == 'aggressive' else None
+            
+            # Count objects for progress estimation (rough)
+            all_objects = list(pdf.objects)
+            total_objs = len(all_objects)
+            
+            for idx, obj in enumerate(all_objects):
+                # Throttle progress updates
+                if idx % 50 == 0 and progress_queue:
+                    progress_queue.put(('status', f"Optimizing Object {idx}/{total_objs}...", 0))
 
-            count = 0
-            for obj in list(pdf.objects):
                 try:
-                    # Basic Validation: Must be an Image XObject
                     if not (isinstance(obj, pikepdf.Stream) and obj.get('/Subtype') == pikepdf.Name('/Image')):
                         continue
                     
-                    # Skip thumbnail masks or tiny bits
+                    # Size Guard
                     try:
                         if '/Width' in obj and int(obj['/Width']) < 50: continue
                         if '/Height' in obj and int(obj['/Height']) < 50: continue
                     except: pass
 
-                    # --- Extract Image ---
+                    # Extract
                     try:
                         pdf_img = PdfImage(obj)
                         pil_img = pil_from_pdfimage(pdf_img)
-                    except Exception:
-                        continue # Cannot decode, skip
+                        if pil_img is None: continue
+                    except: continue
 
-                    # Capture original size
-                    try:
-                        original_bytes = read_stream_bytes(obj) or b''
-                        original_size = len(original_bytes)
-                    except: 
-                        original_size = 0
+                    # Original Size
+                    original_size = get_raw_stream_length(obj)
 
-                    # --- Mode Processing ---
-
-                    # 1. Grayscale Conversion
+                    # 1. Grayscale
                     if grayscale and pil_img.mode != 'L':
                         pil_img = pil_img.convert('L')
 
-                    # 2. Downscaling (Crucial for compression)
+                    # 2. Resize
                     if max_dim:
                         pil_img = resize_image(pil_img, max_dim)
 
-                    # 3. Encoding Logic
+                    # 3. Encode
                     new_data = None
                     is_lossless = (mode == 'lossless-smart')
                     
-                    # Handle Transparency
                     has_alpha = pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info)
-                    
-                    # Logic: 
-                    # If Lossless -> Try PNG optimization
-                    # If Safe/Aggressive -> Flatten transparency and use JPEG
-                    
+
                     if is_lossless:
-                        # Try Optimized PNG
                         png_data = png_bytes_from_pil(pil_img, optimize=True)
-                        # We only accept if smaller
                         if original_size == 0 or len(png_data) < original_size:
                             new_data = png_data
                             new_filter = pikepdf.Name('/FlateDecode')
                             new_colorspace = pikepdf.Name('/DeviceRGB') if pil_img.mode == 'RGB' else pikepdf.Name('/DeviceGray')
-                    
-                    else: 
-                        # Safe OR Aggressive (Use JPEG)
-                        # Flatten alpha if present so we can use JPEG
+                    else:
                         if has_alpha:
                             pil_img = flatten_alpha(pil_img)
-                        
-                        # Ensure RGB or L for JPEG
                         if pil_img.mode not in ('RGB', 'L'):
                             pil_img = pil_img.convert('RGB')
-
-                        # Generate JPEG
-                        # Aggressive: Lower subsampling, slightly lower quality scaling
-                        q = quality_val
-                        sub = 0 if mode == 'safe' else 2 # 2 is 4:2:0 subsampling (smaller)
                         
+                        q = quality_val
+                        sub = 0 if mode == 'safe' else 2
                         jpeg_data = jpeg_bytes_from_pil(pil_img, q, subsampling=sub)
                         
-                        # Accept logic:
-                        # If original_size is unknown -> Accept
-                        # If smaller -> Accept
-                        # If Aggressive -> Accept even if size is roughly same (because we might have standardized the format)
-                        accept_change = False
-                        if original_size == 0: accept_change = True
-                        elif len(jpeg_data) < original_size: accept_change = True
-                        elif mode == 'aggressive': 
-                             # Allow a 10% margin if we cleaned up a messy format
-                            if len(jpeg_data) < original_size * 1.1:
-                                accept_change = True
+                        accept = False
+                        if original_size == 0: accept = True
+                        elif len(jpeg_data) < original_size: accept = True
+                        elif mode == 'aggressive' and len(jpeg_data) < original_size * 1.1: accept = True
                         
-                        if accept_change:
+                        if accept:
                             new_data = jpeg_data
-                            new_filter = pikepdf.Name('/DCTDecode') # JPEG standard
+                            new_filter = pikepdf.Name('/DCTDecode')
                             new_colorspace = pikepdf.Name('/DeviceRGB') if pil_img.mode == 'RGB' else pikepdf.Name('/DeviceGray')
 
-                    # --- Write Changes ---
                     if new_data:
                         obj.clear()
                         obj.write(new_data)
@@ -334,36 +354,28 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
                         obj['/BitsPerComponent'] = 8
                         obj['/Filter'] = new_filter
                         
-                        # Clean up old masking/decoding params that might conflict
                         for k in ['/Decode', '/Mask', '/SMask', '/Matte', '/ColorKeyMask', '/DecodeParms']:
                             if k in obj:
                                 try: del obj[k]
                                 except: pass
-                        
-                        count += 1
-                        
-                except Exception as e:
-                    # print(f"Error processing image: {e}") 
+
+                except Exception:
                     continue
 
-            # Save with object stream linearizing
             pdf.save(output_path, object_stream_mode=pikepdf.ObjectStreamMode.generate)
             pdf.close()
+            return True, "Success"
             
         except Exception as e:
-            shutil.copy2(temp_cleaned, output_path)
-            return True, f"Success (Compression skipped: {e})"
-
-        if update_progress:
-            update_progress(100)
-        return True, "Success"
+            # If optimization fails, copy the cleaned file
+            shutil.copy2(current_input, output_path)
+            return True, f"Success (Optimization skipped: {e})"
 
     except Exception as e:
         return False, f"Error: {e}"
-
     finally:
         for p in [temp_repaired, temp_cleaned]:
-            if os.path.exists(p):
+            if p and os.path.exists(p):
                 try: os.remove(p)
                 except: pass
 
@@ -373,16 +385,19 @@ def process_pdf_pipeline(input_path, output_path, watermark_text, quality_val, m
 
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
     # Disable UI
-    for widget in [save_button, batch_button, browse_button, paste_button]:
+    for widget in [save_button, batch_button, browse_button, paste_wm_button]:
         widget.state(['disabled'])
+        
+    # Unbind click to prevent double loading during process
+    input_entry.unbind("<Button-1>")
     
     progress_bar['value'] = 0
     status_label.config(text="Initializing...", foreground="#0056b3")
 
-    watermark = watermark_entry.get()
-    # If compression is disabled, set quality to 100 to avoid degradation if rasterization is forced
+    # Gather Settings
     quality = int(quality_scale.get()) if compress_var.get() else 100
     grayscale = grayscale_var.get()
+    wm_text = watermark_entry.get().strip()
 
     mode_choice = compression_mode_var.get()
     if mode_choice == "Safe Compression": mode = 'safe'
@@ -391,30 +406,68 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     elif mode_choice == "Rasterize (B&W Fax Mode)": mode = 'rasterize_fax'
     else: mode = 'lossless-smart'
 
+    # Setup Queue
+    manager = multiprocessing.Manager()
+    progress_queue = manager.Queue()
+
+    tasks = []
+    for file_path in files_to_process:
+        filename = os.path.basename(file_path)
+        if single_output:
+            current_output = single_output
+        else:
+            name, ext = os.path.splitext(filename)
+            current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
+        
+        tasks.append((file_path, current_output, wm_text, quality, mode, grayscale, progress_queue))
+
+    def poll_queue():
+        try:
+            while True:
+                msg = progress_queue.get_nowait()
+                msg_type = msg[0]
+                if msg_type == 'progress':
+                    _, current, total = msg
+                    if total > 0:
+                        percent = (current / total) * 100
+                        progress_bar['value'] = percent
+                        status_label.config(text=f"Processing Page {current}/{total}")
+                elif msg_type == 'status':
+                    _, text, _ = msg
+                    status_label.config(text=text)
+        except queue.Empty:
+            pass
+            
+        if save_button.instate(['disabled']):
+            root.after(100, poll_queue)
+
+    root.after(100, poll_queue)
+
     def run_job():
         success_count = 0
         errors = []
-        total_files = len(files_to_process)
+        total_files = len(tasks)
+        completed = 0
 
-        for idx, file_path in enumerate(files_to_process):
-            filename = os.path.basename(file_path)
-            if single_output:
-                current_output = single_output
-            else:
-                name, ext = os.path.splitext(filename)
-                current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
-
-            root.after(0, lambda f=filename: status_label.config(text=f"Processing: {f}"))
-
-            def update_progress(val):
-                overall = ((idx + (val/100)) / total_files) * 100
-                root.after(0, lambda v=overall: progress_bar.configure(value=v))
-
-            success, msg = process_pdf_pipeline(file_path, current_output, watermark, quality, mode, grayscale, update_progress)
-
-            if success: success_count += 1
-            else: errors.append(f"{filename}: {msg}")
-
+        max_workers = 1 # Avoid conflicts with heavy PDF ops
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(process_pdf_pipeline, task): task[0] for task in tasks}
+            
+            for future in concurrent.futures.as_completed(future_to_file):
+                file_path = future_to_file[future]
+                filename = os.path.basename(file_path)
+                try:
+                    success, msg = future.result()
+                    if success:
+                        success_count += 1
+                    else:
+                        errors.append(f"{filename}: {msg}")
+                except Exception as exc:
+                    errors.append(f"{filename}: Exception: {exc}")
+                
+                completed += 1
+                
         root.after(0, lambda: finish_processing(success_count, total_files, errors))
 
     threading.Thread(target=run_job, daemon=True).start()
@@ -423,8 +476,11 @@ def finish_processing(success_count, total_count, errors):
     progress_bar['value'] = 100
     status_label.config(text="Processing Complete", foreground="green")
     
-    for widget in [save_button, batch_button, browse_button, paste_button]:
+    for widget in [save_button, batch_button, browse_button, paste_wm_button]:
         widget.state(['!disabled'])
+    
+    # Rebind click
+    input_entry.bind("<Button-1>", lambda e: open_file())
 
     result_msg = f"Processed {success_count}/{total_count} files successfully."
     if errors:
@@ -435,7 +491,11 @@ def finish_processing(success_count, total_count, errors):
 
 # --- UI Action Functions ---
 
-def open_file():
+def open_file(event=None):
+    # If the widget is disabled (during processing), do nothing
+    if input_entry.instate(['disabled']):
+        return
+        
     file_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
     if file_path:
         input_entry.delete(0, tk.END)
@@ -444,6 +504,18 @@ def open_file():
         name_root, ext = os.path.splitext(name)
         output_entry.delete(0, tk.END)
         output_entry.insert(0, os.path.join(folder, f"{name_root}_cleaned{ext}"))
+    return "break" # Stop default focus behavior
+
+def paste_watermark_text():
+    try:
+        text = root.clipboard_get()
+        if text:
+            watermark_entry.delete(0, tk.END)
+            watermark_entry.insert(0, text.strip())
+            status_label.config(text="Watermark pasted", foreground="green")
+            root.after(1500, lambda: status_label.config(text="Ready", foreground="gray"))
+    except Exception as e:
+        messagebox.showerror("Paste Error", f"Could not paste: {e}")
 
 def run_single_file():
     input_path = input_entry.get()
@@ -463,16 +535,6 @@ def run_batch():
     if not output_dir: return
     start_processing_thread(files, output_dir=output_dir)
 
-def paste_from_clipboard():
-    try:
-        text = root.clipboard_get()
-        if text:
-            watermark_entry.delete(0, tk.END)
-            watermark_entry.insert(0, text)
-            status_label.config(text="Text pasted from clipboard", foreground="green")
-            root.after(1500, lambda: status_label.config(text="Ready", foreground="gray"))
-    except: pass
-
 def update_scale_label(val):
     quality_label_var.set(f"Quality: {int(float(val))}%")
 
@@ -480,129 +542,129 @@ def toggle_compression():
     if compress_var.get():
         quality_scale.state(['!disabled'])
         compression_mode_dropdown.state(['!disabled'])
-        compression_mode_dropdown.config(state="readonly") # Prevent typing
+        compression_mode_dropdown.config(state="readonly")
         grayscale_check.state(['!disabled'])
     else:
         quality_scale.state(['disabled'])
-        compression_mode_dropdown.state(['disabled']) # Fully disabled
+        compression_mode_dropdown.state(['disabled'])
         grayscale_check.state(['disabled'])
 
 # ----------------------------
 # GUI Setup
 # ----------------------------
 
-root = tk.Tk()
-root.title("CleanPDF")
-root.geometry("500x620")
-root.minsize(500, 620)
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
 
-# 1. Styling
-style = ttk.Style()
-style.theme_use('clam')
+    root = tk.Tk()
+    root.title("CleanPDF")
+    root.geometry("500x600") 
+    root.minsize(500, 600)
 
-# Colors
-BG_COLOR = "#ffffff"
-FG_COLOR = "#333333"
-ACCENT_COLOR = "#0066cc" # Nice Blue
-ACCENT_HOVER = "#0052a3"
+    # 1. Styling
+    style = ttk.Style()
+    style.theme_use('clam')
 
-style.configure(".", background=BG_COLOR, foreground=FG_COLOR, font=("Segoe UI", 10))
-style.configure("TFrame", background=BG_COLOR)
-style.configure("TLabelframe", background=BG_COLOR, padding=15)
-style.configure("TLabelframe.Label", background=BG_COLOR, foreground="#666666", font=("Segoe UI", 9, "bold"))
+    BG_COLOR = "#ffffff"
+    FG_COLOR = "#333333"
+    ACCENT_COLOR = "#0066cc" 
+    ACCENT_HOVER = "#0052a3"
 
-# Button Styles
-style.configure("TButton", padding=6, relief="flat", background="#e1e1e1", borderwidth=0)
-style.map("TButton", background=[('active', '#d4d4d4')])
+    style.configure(".", background=BG_COLOR, foreground=FG_COLOR, font=("Segoe UI", 10))
+    style.configure("TFrame", background=BG_COLOR)
+    style.configure("TLabelframe", background=BG_COLOR, padding=15)
+    style.configure("TLabelframe.Label", background=BG_COLOR, foreground="#666666", font=("Segoe UI", 9, "bold"))
+    style.configure("TButton", padding=6, relief="flat", background="#e1e1e1", borderwidth=0)
+    style.map("TButton", background=[('active', '#d4d4d4')])
+    style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="white", font=("Segoe UI", 10, "bold"))
+    style.map("Accent.TButton", background=[('active', ACCENT_HOVER)])
 
-style.configure("Accent.TButton", background=ACCENT_COLOR, foreground="white", font=("Segoe UI", 10, "bold"))
-style.map("Accent.TButton", background=[('active', ACCENT_HOVER)])
+    # 2. Layout
+    main_container = ttk.Frame(root, padding=20)
+    main_container.pack(fill=tk.BOTH, expand=True)
 
-# 2. Layout
-main_container = ttk.Frame(root, padding=20)
-main_container.pack(fill=tk.BOTH, expand=True)
+    # Header
+    header_frame = ttk.Frame(main_container)
+    header_frame.pack(fill=tk.X, pady=(0, 20))
+    ttk.Label(header_frame, text="PDF Optimizer", font=("Segoe UI", 16, "bold"), foreground=FG_COLOR).pack(side=tk.LEFT)
+    status_label = ttk.Label(header_frame, text="Ready", foreground="gray", font=("Segoe UI", 9))
+    status_label.pack(side=tk.RIGHT, anchor="s")
 
-# Header
-header_frame = ttk.Frame(main_container)
-header_frame.pack(fill=tk.X, pady=(0, 20))
-ttk.Label(header_frame, text="PDF Optimizer", font=("Segoe UI", 16, "bold"), foreground=FG_COLOR).pack(side=tk.LEFT)
-status_label = ttk.Label(header_frame, text="Ready", foreground="gray", font=("Segoe UI", 9))
-status_label.pack(side=tk.RIGHT, anchor="s")
+    # Section 1: Files & Watermark
+    file_frame = ttk.LabelFrame(main_container, text="Configuration", padding=(15, 10))
+    file_frame.pack(fill=tk.X, pady=(0, 15))
 
-# Section 1: Files & Watermark
-file_frame = ttk.LabelFrame(main_container, text="Configuration", padding=(15, 10))
-file_frame.pack(fill=tk.X, pady=(0, 15))
+    # Input (Clickable)
+    ttk.Label(file_frame, text="Input File:").grid(row=0, column=0, sticky="w", pady=5)
+    input_entry = ttk.Entry(file_frame)
+    input_entry.grid(row=0, column=1, sticky="ew", padx=5)
+    input_entry.bind("<Button-1>", open_file) # Click to open
+    
+    browse_button = ttk.Button(file_frame, text="...", width=4, command=open_file)
+    browse_button.grid(row=0, column=2, sticky="e")
 
-# Input
-ttk.Label(file_frame, text="Input File:").grid(row=0, column=0, sticky="w", pady=5)
-input_entry = ttk.Entry(file_frame)
-input_entry.grid(row=0, column=1, sticky="ew", padx=5)
-browse_button = ttk.Button(file_frame, text="...", width=4, command=open_file)
-browse_button.grid(row=0, column=2, sticky="e")
+    # Output
+    ttk.Label(file_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=5)
+    output_entry = ttk.Entry(file_frame)
+    output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=2)
 
-# Output
-ttk.Label(file_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=5)
-output_entry = ttk.Entry(file_frame)
-output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=2)
+    # Watermark + Paste
+    ttk.Label(file_frame, text="Watermark:").grid(row=2, column=0, sticky="w", pady=5)
+    watermark_entry = ttk.Entry(file_frame)
+    watermark_entry.grid(row=2, column=1, sticky="ew", padx=5)
+    
+    paste_wm_button = ttk.Button(file_frame, text="Paste", width=6, command=paste_watermark_text)
+    paste_wm_button.grid(row=2, column=2, sticky="e")
 
-# Watermark
-ttk.Label(file_frame, text="Watermark:").grid(row=2, column=0, sticky="w", pady=5)
-watermark_entry = ttk.Entry(file_frame)
-watermark_entry.insert(0, "watermark")
-watermark_entry.grid(row=2, column=1, sticky="ew", padx=5)
-paste_button = ttk.Button(file_frame, text="Paste", width=6, command=paste_from_clipboard)
-paste_button.grid(row=2, column=2, sticky="e")
+    file_frame.columnconfigure(1, weight=1)
 
-file_frame.columnconfigure(1, weight=1)
+    # Section 2: Optimization
+    opt_frame = ttk.LabelFrame(main_container, text="Optimization", padding=(15, 10))
+    opt_frame.pack(fill=tk.X, pady=(0, 15))
 
-# Section 2: Optimization Settings
-opt_frame = ttk.LabelFrame(main_container, text="Optimization", padding=(15, 10))
-opt_frame.pack(fill=tk.X, pady=(0, 15))
+    compress_var = tk.BooleanVar(value=False)
+    compress_check = ttk.Checkbutton(opt_frame, text="Enable Compression & Rasterization", variable=compress_var, command=toggle_compression)
+    compress_check.pack(anchor="w", pady=(0, 10))
 
-compress_var = tk.BooleanVar(value=False)
-compress_check = ttk.Checkbutton(opt_frame, text="Enable Compression & Rasterization", variable=compress_var, command=toggle_compression)
-compress_check.pack(anchor="w", pady=(0, 10))
+    settings_inner = ttk.Frame(opt_frame)
+    settings_inner.pack(fill=tk.X, padx=10)
 
-# Settings Container (Internal)
-settings_inner = ttk.Frame(opt_frame)
-settings_inner.pack(fill=tk.X, padx=10)
+    compression_mode_var = tk.StringVar(value="Safe Compression")
+    compression_mode_dropdown = ttk.Combobox(settings_inner, textvariable=compression_mode_var, state="disabled",
+                                             values=[
+                                                 "Safe Compression", 
+                                                 "Aggressive Compression", 
+                                                 "Lossless Smart",
+                                                 "Rasterize (Standard)",
+                                                 "Rasterize (B&W Fax Mode)"
+                                             ])
+    compression_mode_dropdown.pack(fill=tk.X, pady=(0, 10))
 
-compression_mode_var = tk.StringVar(value="Safe Compression")
-compression_mode_dropdown = ttk.Combobox(settings_inner, textvariable=compression_mode_var, state="disabled",
-                                         values=[
-                                             "Safe Compression", 
-                                             "Aggressive Compression", 
-                                             "Lossless Smart", 
-                                             "Rasterize (Standard)", 
-                                             "Rasterize (B&W Fax Mode)"
-                                         ])
-compression_mode_dropdown.pack(fill=tk.X, pady=(0, 10))
+    quality_label_var = tk.StringVar(value="Quality: 75%")
+    ttk.Label(settings_inner, textvariable=quality_label_var, font=("Segoe UI", 9)).pack(anchor="w")
+    quality_scale = ttk.Scale(settings_inner, from_=10, to=100, orient="horizontal", command=update_scale_label)
+    quality_scale.set(75)
+    quality_scale.pack(fill=tk.X, pady=(0, 10))
+    quality_scale.state(['disabled'])
 
-quality_label_var = tk.StringVar(value="Quality: 75%")
-ttk.Label(settings_inner, textvariable=quality_label_var, font=("Segoe UI", 9)).pack(anchor="w")
-quality_scale = ttk.Scale(settings_inner, from_=10, to=100, orient="horizontal", command=update_scale_label)
-quality_scale.set(75)
-quality_scale.pack(fill=tk.X, pady=(0, 10))
-quality_scale.state(['disabled'])
+    grayscale_var = tk.BooleanVar(value=False)
+    grayscale_check = ttk.Checkbutton(settings_inner, text="Convert to Grayscale", variable=grayscale_var, state='disabled')
+    grayscale_check.pack(anchor="w")
 
-grayscale_var = tk.BooleanVar(value=False)
-grayscale_check = ttk.Checkbutton(settings_inner, text="Convert to Grayscale", variable=grayscale_var, state='disabled')
-grayscale_check.pack(anchor="w")
+    # Section 3: Actions
+    action_frame = ttk.Frame(main_container)
+    action_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
-# Section 3: Actions
-action_frame = ttk.Frame(main_container)
-action_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+    progress_bar = ttk.Progressbar(action_frame, orient="horizontal", mode="determinate")
+    progress_bar.pack(fill=tk.X, pady=(0, 15))
 
-progress_bar = ttk.Progressbar(action_frame, orient="horizontal", mode="determinate")
-progress_bar.pack(fill=tk.X, pady=(0, 15))
+    btn_grid = ttk.Frame(action_frame)
+    btn_grid.pack(fill=tk.X)
 
-btn_grid = ttk.Frame(action_frame)
-btn_grid.pack(fill=tk.X)
+    save_button = ttk.Button(btn_grid, text="Process Single File", style="Accent.TButton", command=run_single_file)
+    save_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
 
-save_button = ttk.Button(btn_grid, text="Process Single File", style="Accent.TButton", command=run_single_file)
-save_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+    batch_button = ttk.Button(btn_grid, text="Batch Process", style="Accent.TButton", command=run_batch)
+    batch_button.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
 
-batch_button = ttk.Button(btn_grid, text="Batch Process", style="Accent.TButton", command=run_batch)
-batch_button.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
-
-root.mainloop()
+    root.mainloop()
