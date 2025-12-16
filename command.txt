@@ -1,0 +1,1 @@
+pyinstaller --noconfirm --onefile --windowed --noconsole --name "PDF HC" --icon="icon.ico" --add-data="icon.ico;." --exclude-module "email" --exclude-module "http" --exclude-module "xml" --exclude-module "pydoc" --exclude-module "unittest" watermark_remover_hc.py
