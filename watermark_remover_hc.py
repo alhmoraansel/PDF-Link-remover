@@ -5,7 +5,7 @@ import threading
 import io
 import tempfile
 import shutil
-import fitz  # PyMuPDF (Restored for Rasterization)
+import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
 from pikepdf import Name, Dictionary, Array
@@ -78,6 +78,53 @@ def png_bytes_from_pil(pil_img, optimize=True):
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG", optimize=bool(optimize))
     return buf.getvalue()
+
+# ----------------------------
+# Watermark Removal Helper (Robust PyMuPDF)
+# ----------------------------
+
+def remove_text_watermark_fitz(input_path, output_path, text_to_remove):
+    """
+    Uses PyMuPDF to find text. 
+    CRITICAL FIX: uses apply_redactions with specific flags to delete 
+    text ONLY, preserving images and vector graphics behind it.
+    """
+    try:
+        doc = fitz.open(input_path)
+        found_any = False
+        
+        # We accept comma-separated phrases if the user wants multiple
+        phrases = [p.strip() for p in text_to_remove.split(',')]
+
+        for page in doc:
+            page_hits = 0
+            for phrase in phrases:
+                if not phrase: continue
+                
+                # Search for the text (case insensitive usually by default in recent fitz, 
+                # but we can't control it easily without flags. Search is robust.)
+                quads = page.search_for(phrase)
+                
+                if quads:
+                    page_hits += 1
+                    found_any = True
+                    for quad in quads:
+                        # Add a redaction annotation
+                        # We set fill to None to be extra safe, though apply_redactions flags handle the logic
+                        page.add_redact_annot(quad, fill=False)
+            
+            if page_hits > 0:
+                # APPLY REDACTION
+                # images=fitz.PDF_REDACT_IMAGE_NONE (0) -> Do not touch images (no white box over image)
+                # graphics=fitz.PDF_REDACT_LINE_NONE (0) -> Do not touch vector graphics/lines (no white box over background colors)
+                # text=1 -> Remove text
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_NONE)
+        
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+        return True, found_any
+    except Exception as e:
+        return False, str(e)
 
 # ----------------------------
 # Rasterization Logic (Using PyMuPDF/fitz)
@@ -193,14 +240,32 @@ def yield_images_from_resources(resources, processed_oids):
 
 def process_pdf_pipeline(args):
     # Added progress_queue to args for live feedback
-    input_path, output_path, quality_val, mode, grayscale, progress_queue = args
+    input_path, output_path, quality_val, mode, grayscale, watermark_text, progress_queue = args
     
+    temp_cleaned_path = None
+
     try:
+        # --- Pre-processing: Watermark Removal ---
+        # If the user requested watermark removal, we do it first on a temp copy
+        current_input = input_path
+        
+        if watermark_text and watermark_text.strip():
+            fd, temp_cleaned_path = tempfile.mkstemp(suffix="_wm.pdf")
+            os.close(fd)
+            
+            if progress_queue:
+                progress_queue.put(('status', "Removing Watermarks (Smart Redact)...", 0))
+            
+            # Use Improved PyMuPDF method
+            success, msg = remove_text_watermark_fitz(input_path, temp_cleaned_path, watermark_text)
+            if success:
+                current_input = temp_cleaned_path
+        
         # --- Branch 1: Rasterization (Uses PyMuPDF/fitz) ---
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
             success, msg = rasterize_and_rebuild(
-                input_path, 
+                current_input, 
                 output_path, 
                 quality_val, 
                 grayscale, 
@@ -210,7 +275,7 @@ def process_pdf_pipeline(args):
             return success, msg
 
         # --- Branch 2: Structural Cleaning & Compression (Uses Pikepdf) ---
-        pdf = pikepdf.open(input_path, allow_overwriting_input=True)
+        pdf = pikepdf.open(current_input, allow_overwriting_input=True)
         
         # 1. Structural Cleaning
         try: pdf.docinfo.clear()
@@ -388,6 +453,11 @@ def process_pdf_pipeline(args):
 
     except Exception as e:
         return False, f"Error: {e}"
+    finally:
+        # CLEANUP TEMP FILE
+        if temp_cleaned_path and os.path.exists(temp_cleaned_path):
+            try: os.remove(temp_cleaned_path)
+            except: pass
 
 # ----------------------------
 # Threading & UI Logic
@@ -395,7 +465,7 @@ def process_pdf_pipeline(args):
 
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
     # Disable UI
-    for widget in [save_button, batch_button, browse_button]:
+    for widget in [save_button, batch_button, browse_button, paste_button]:
         widget.state(['disabled'])
     
     progress_bar['value'] = 0
@@ -403,6 +473,11 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
 
     quality = int(quality_scale.get()) if compress_var.get() else 100
     grayscale = grayscale_var.get()
+    
+    # Get Watermark Settings
+    wm_text = None
+    if remove_wm_var.get():
+        wm_text = wm_entry.get().strip()
 
     mode_choice = compression_mode_var.get()
     if mode_choice == "Safe Compression": mode = 'safe'
@@ -427,7 +502,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
             current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
         
         # Pass the queue to the worker
-        tasks.append((file_path, current_output, quality, mode, grayscale, progress_queue))
+        tasks.append((file_path, current_output, quality, mode, grayscale, wm_text, progress_queue))
 
     # Polling function for granular progress
     def poll_queue():
@@ -446,6 +521,10 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
                         percent = (current / total) * 100
                         progress_bar['value'] = percent
                         status_label.config(text=f"Processing Page {current}/{total}")
+                elif msg_type == 'status':
+                    _, text, _ = msg
+                    status_label.config(text=text)
+                    
         except queue.Empty:
             pass
             
@@ -499,7 +578,7 @@ def finish_processing(success_count, total_count, errors):
     progress_bar['value'] = 100
     status_label.config(text="Processing Complete", foreground="green")
     
-    for widget in [save_button, batch_button, browse_button]:
+    for widget in [save_button, batch_button, browse_button, paste_button]:
         widget.state(['!disabled'])
 
     result_msg = f"Processed {success_count}/{total_count} files successfully."
@@ -520,6 +599,24 @@ def open_file():
         name_root, ext = os.path.splitext(name)
         output_entry.delete(0, tk.END)
         output_entry.insert(0, os.path.join(folder, f"{name_root}_cleaned{ext}"))
+
+def paste_path():
+    try:
+        path = root.clipboard_get()
+        # Clean quotes if present (Windows "Copy as path" adds quotes)
+        path = path.strip().strip('"')
+        if os.path.exists(path) and path.lower().endswith('.pdf'):
+            input_entry.delete(0, tk.END)
+            input_entry.insert(0, path)
+            # Auto-suggest output
+            folder, name = os.path.split(path)
+            name_root, ext = os.path.splitext(name)
+            output_entry.delete(0, tk.END)
+            output_entry.insert(0, os.path.join(folder, f"{name_root}_cleaned{ext}"))
+        else:
+            messagebox.showwarning("Invalid Paste", "Clipboard does not contain a valid PDF path.")
+    except Exception as e:
+        messagebox.showerror("Paste Error", f"Could not paste from clipboard: {e}")
 
 def run_single_file():
     input_path = input_entry.get()
@@ -553,6 +650,12 @@ def toggle_compression():
         compression_mode_dropdown.state(['disabled'])
         grayscale_check.state(['disabled'])
 
+def toggle_watermark():
+    if remove_wm_var.get():
+        wm_entry.state(['!disabled'])
+    else:
+        wm_entry.state(['disabled'])
+
 # ----------------------------
 # GUI Setup
 # ----------------------------
@@ -562,8 +665,8 @@ if __name__ == "__main__":
 
     root = tk.Tk()
     root.title("CleanPDF (Hybrid) - Fixed")
-    root.geometry("500x550") 
-    root.minsize(500, 550)
+    root.geometry("500x650") 
+    root.minsize(500, 650)
 
     # 1. Styling
     style = ttk.Style()
@@ -605,17 +708,38 @@ if __name__ == "__main__":
     ttk.Label(file_frame, text="Input File:").grid(row=0, column=0, sticky="w", pady=5)
     input_entry = ttk.Entry(file_frame)
     input_entry.grid(row=0, column=1, sticky="ew", padx=5)
+    
+    # Browse Button
     browse_button = ttk.Button(file_frame, text="...", width=4, command=open_file)
-    browse_button.grid(row=0, column=2, sticky="e")
+    browse_button.grid(row=0, column=2, sticky="e", padx=(0, 5))
+
+    # Paste Button
+    paste_button = ttk.Button(file_frame, text="Paste", width=6, command=paste_path)
+    paste_button.grid(row=0, column=3, sticky="e")
 
     # Output
     ttk.Label(file_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=5)
     output_entry = ttk.Entry(file_frame)
-    output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=2)
+    output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=3)
 
     file_frame.columnconfigure(1, weight=1)
 
-    # Section 2: Optimization Settings
+    # Section 2: Watermark Removal (NEW)
+    wm_frame = ttk.LabelFrame(main_container, text="Watermark Removal", padding=(15, 10))
+    wm_frame.pack(fill=tk.X, pady=(0, 15))
+
+    remove_wm_var = tk.BooleanVar(value=False)
+    remove_wm_check = ttk.Checkbutton(wm_frame, text="Remove Specific Text", variable=remove_wm_var, command=toggle_watermark)
+    remove_wm_check.pack(anchor="w", pady=(0, 5))
+
+    wm_inner = ttk.Frame(wm_frame)
+    wm_inner.pack(fill=tk.X)
+    ttk.Label(wm_inner, text="Text to Remove:").pack(side=tk.LEFT)
+    wm_entry = ttk.Entry(wm_inner)
+    wm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+    wm_entry.state(['disabled'])
+
+    # Section 3: Optimization Settings
     opt_frame = ttk.LabelFrame(main_container, text="Optimization", padding=(15, 10))
     opt_frame.pack(fill=tk.X, pady=(0, 15))
 
@@ -648,7 +772,7 @@ if __name__ == "__main__":
     grayscale_check = ttk.Checkbutton(settings_inner, text="Convert Images to Grayscale", variable=grayscale_var, state='disabled')
     grayscale_check.pack(anchor="w")
 
-    # Section 3: Actions
+    # Section 4: Actions
     action_frame = ttk.Frame(main_container)
     action_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
