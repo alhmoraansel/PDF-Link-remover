@@ -6,13 +6,13 @@ import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
 from pikepdf import Name
-from PIL import Image
+from PIL import Image, ImageEnhance  # Added ImageEnhance
 
 # Allow loading truncated images
 Image.LOAD_TRUNCATED_IMAGES = True
 
 # ==========================================
-# 1. CORE LOGIC & HELPERS (PRESERVED)
+# 1. CORE LOGIC & HELPERS
 # ==========================================
 
 def get_raw_stream_length(obj):
@@ -56,8 +56,6 @@ def resize_image(pil_img, max_dim=None):
 def remove_text_watermark_fitz(input_path, output_path, text_to_remove):
     """
     Uses PyMuPDF to find text.
-    CRITICAL FIX: uses apply_redactions with specific flags to delete 
-    text ONLY, preserving images and vector graphics behind it.
     """
     try:
         doc = fitz.open(input_path)
@@ -114,8 +112,22 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
             buf = io.BytesIO()
 
             if fax_mode:
-                img = img.convert('L').point(lambda x: 0 if x < 200 else 255, '1')
+                # --- UPDATED LOGIC START ---
+                # 1. Ensure Grayscale
+                if img.mode != 'L':
+                    img = img.convert('L')
+
+                # 2. Enhance Contrast (Separates faint text from grey background)
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(2.0)  # Boost contrast by 2x
+                
+                # 3. Apply Threshold
+                # Previous logic: < 200 became Black (0). This turned light grey (190) into black.
+                # New logic: < 128 becomes Black. This keeps light grey (130+) as White (255).
+                img = img.point(lambda x: 0 if x < 128 else 255, '1')
+                
                 img.save(buf, format="TIFF", compression="group4")
+                # --- UPDATED LOGIC END ---
             else:
                 if grayscale:
                     img = img.convert('L')
@@ -170,7 +182,7 @@ def yield_images_from_resources(resources, processed_oids):
             continue
 
 # ==========================================
-# 2. MAIN PIPELINE (ADAPTED FOR STREAMLIT)
+# 2. MAIN PIPELINE
 # ==========================================
 
 def process_pdf_pipeline(args):
@@ -373,8 +385,6 @@ class StreamlitLogger:
             if total > 0:
                 percent = current / total
                 self.progress_bar.progress(percent)
-                # Optional: Update text on progress
-                # self.log_placeholder.text(f"Processing page {current}/{total}...")
         elif msg_type == 'status':
             _, text, _ = msg
             self.log_placeholder.code(text)
@@ -456,7 +466,6 @@ def main():
                 output_path = tmp_out.name
 
             # 3. RUN PIPELINE
-            # args: (input_path, output_path, quality_val, mode, grayscale, watermark_text, progress_queue)
             args = (input_path, output_path, quality, mode, grayscale, wm_text, logger)
             
             success, msg = process_pdf_pipeline(args)
