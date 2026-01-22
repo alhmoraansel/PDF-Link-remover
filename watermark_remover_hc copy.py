@@ -5,13 +5,14 @@ import threading
 import io
 import tempfile
 import shutil
-import fitz  # PyMuPDF (Restored for Rasterization)
+import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
 from pikepdf import Name, Dictionary, Array
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance  # Added ImageEnhance
 import concurrent.futures
 import multiprocessing
+import queue  # Standard queue for polling
 
 # Allow loading truncated images
 Image.LOAD_TRUNCATED_IMAGES = True
@@ -79,10 +80,57 @@ def png_bytes_from_pil(pil_img, optimize=True):
     return buf.getvalue()
 
 # ----------------------------
+# Watermark Removal Helper (Robust PyMuPDF)
+# ----------------------------
+
+def remove_text_watermark_fitz(input_path, output_path, text_to_remove):
+    """
+    Uses PyMuPDF to find text.
+    CRITICAL FIX: uses apply_redactions with specific flags to delete 
+    text ONLY, preserving images and vector graphics behind it.
+    """
+    try:
+        doc = fitz.open(input_path)
+        found_any = False
+        
+        # We accept comma-separated phrases if the user wants multiple
+        phrases = [p.strip() for p in text_to_remove.split(',')]
+
+        for page in doc:
+            page_hits = 0
+            
+            for phrase in phrases:
+                if not phrase: continue
+                
+                # Search for the text
+                quads = page.search_for(phrase)
+                
+                if quads:
+                    page_hits += 1
+                    found_any = True
+                    for quad in quads:
+                        # Add a redaction annotation
+                        # We set fill to None to be extra safe
+                        page.add_redact_annot(quad, fill=False)
+            
+            if page_hits > 0:
+                # APPLY REDACTION
+                # images=fitz.PDF_REDACT_IMAGE_NONE (0) -> Do not touch images (no white box over image)
+                # graphics=fitz.PDF_REDACT_LINE_NONE (0) -> Do not touch vector graphics/lines
+                # text=1 -> Remove text
+                page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_NONE)
+        
+        doc.save(output_path, garbage=4, deflate=True)
+        doc.close()
+        return True, found_any
+    except Exception as e:
+        return False, str(e)
+
+# ----------------------------
 # Rasterization Logic (Using PyMuPDF/fitz)
 # ----------------------------
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False):
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, progress_queue=None):
     """
     Uses PyMuPDF (fitz) to render pages as images and rebuild the PDF.
     This effectively flattens all layers, annotations, and vector graphics.
@@ -99,7 +147,13 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
 
         mat = fitz.Matrix(zoom, zoom)
 
-        for page in src_doc:
+        total_pages = len(src_doc)
+        
+        for i, page in enumerate(src_doc):
+            # Update Progress
+            if progress_queue:
+                progress_queue.put(('progress', i + 1, total_pages))
+
             pix = page.get_pixmap(matrix=mat, alpha=False)
             mode = "RGB"
             if pix.n == 1: mode = "L"
@@ -108,7 +162,19 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
             buf = io.BytesIO()
 
             if fax_mode:
-                img = img.convert('L').point(lambda x: 0 if x < 200 else 255, '1')
+                # --- UPDATED LOGIC FOR BETTER CLARITY ---
+                # 1. Ensure Grayscale
+                if img.mode != 'L':
+                    img = img.convert('L')
+
+                # 2. Enhance Contrast (Separates faint text from grey background)
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(2.0)  # Boost contrast by 2x
+                
+                # 3. Apply Threshold
+                # < 128 becomes Black. This keeps light grey (130+) as White.
+                img = img.point(lambda x: 0 if x < 128 else 255, '1')
+                
                 img.save(buf, format="TIFF", compression="group4")
             else:
                 if grayscale:
@@ -141,21 +207,87 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         return False, f"Rasterization failed: {e}"
 
 # ----------------------------
+# Page Walker Utilities
+# ----------------------------
+
+def yield_images_from_resources(resources, processed_oids):
+    """
+    Recursively find images in a resource dictionary (handling Form XObjects).
+    Yields valid image objects that haven't been processed yet.
+    """
+    if '/XObject' not in resources:
+        return
+
+    xobjs = resources['/XObject']
+    for name, xobj_ref in xobjs.items():
+        try:
+            xobj = xobj_ref # pikepdf auto-resolves
+            
+            # Avoid processing the same object twice (e.g. repeated logos)
+            # Use getattr(obj, 'objid', None) to be safe, though pikepdf objects usually have it.
+            oid = getattr(xobj, 'objid', None)
+            if oid is not None and oid in processed_oids:
+                continue
+            
+            subtype = xobj.get('/Subtype')
+            
+            if subtype == pikepdf.Name('/Image'):
+                if oid is not None:
+                    processed_oids.add(oid)
+                yield xobj
+                
+            elif subtype == pikepdf.Name('/Form'):
+                # Forms can contain other images. Recurse.
+                if oid is not None:
+                    processed_oids.add(oid) # Mark form as visited
+                
+                if '/Resources' in xobj:
+                    yield from yield_images_from_resources(xobj['/Resources'], processed_oids)
+        except Exception:
+            continue
+
+# ----------------------------
 # Main pipeline (Worker Function)
 # ----------------------------
 
 def process_pdf_pipeline(args):
-    input_path, output_path, quality_val, mode, grayscale = args
+    # Added progress_queue to args for live feedback
+    input_path, output_path, quality_val, mode, grayscale, watermark_text, progress_queue = args
     
+    temp_cleaned_path = None
+
     try:
+        # --- Pre-processing: Watermark Removal ---
+        # If the user requested watermark removal, we do it first on a temp copy
+        current_input = input_path
+        
+        if watermark_text and watermark_text.strip():
+            fd, temp_cleaned_path = tempfile.mkstemp(suffix="_wm.pdf")
+            os.close(fd)
+            
+            if progress_queue:
+                progress_queue.put(('status', "Removing Watermarks (Smart Redact)...", 0))
+            
+            # Use Improved PyMuPDF method
+            success, msg = remove_text_watermark_fitz(input_path, temp_cleaned_path, watermark_text)
+            if success:
+                current_input = temp_cleaned_path
+        
         # --- Branch 1: Rasterization (Uses PyMuPDF/fitz) ---
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
-            success, msg = rasterize_and_rebuild(input_path, output_path, quality_val, grayscale, fax_mode=is_fax)
+            success, msg = rasterize_and_rebuild(
+                current_input, 
+                output_path, 
+                quality_val, 
+                grayscale, 
+                fax_mode=is_fax,
+                progress_queue=progress_queue
+            )
             return success, msg
 
         # --- Branch 2: Structural Cleaning & Compression (Uses Pikepdf) ---
-        pdf = pikepdf.open(input_path, allow_overwriting_input=True)
+        pdf = pikepdf.open(current_input, allow_overwriting_input=True)
         
         # 1. Structural Cleaning
         try: pdf.docinfo.clear()
@@ -172,173 +304,159 @@ def process_pdf_pipeline(args):
         if '/AA' in pdf.Root: del pdf.Root['/AA']
         if '/OpenAction' in pdf.Root: del pdf.Root['/OpenAction']
 
-        # 2. Image Compression / Optimization
+        # 2. Image Compression / Optimization (PAGE BY PAGE)
         max_dim = 1500 if mode == 'aggressive' else None
+        
+        total_pages = len(pdf.pages)
+        processed_oids = set() # Track object IDs to prevent double-processing shared images
 
-        for obj in list(pdf.objects):
-            try:
-                # Validation: Must be an Image XObject
-                if not (isinstance(obj, pikepdf.Stream) and obj.get('/Subtype') == pikepdf.Name('/Image')):
-                    continue
-                
-                # =========================================================
-                # THE GATEKEEPER: STRICT SKIP LOGIC
-                # =========================================================
+        # Iterate Page by Page for better progress tracking
+        for page_idx, page in enumerate(pdf.pages):
+            
+            # Report Progress
+            if progress_queue:
+                progress_queue.put(('progress', page_idx + 1, total_pages))
 
-                # 1. Check for Masks (Alpha/Stencil/Transparency)
-                # If these exist, we CANNOT simply replace the stream with a JPEG.
-                has_mask = False
-                for k in ['/Mask', '/SMask', '/ImageMask', '/Matte']:
-                    if k in obj:
-                        has_mask = True
-                        break
-                if has_mask:
-                    # print(f"[SKIP] Mask detected on object {obj.objid}")
-                    continue
-
-                # 2. Check for Decode Arrays
-                # If /Decode exists (e.g. [1 0] for inversion), we skip. 
-                # Converting to standard JPEG + removing Decode = Inverted Image (Black Box).
-                if '/Decode' in obj:
-                    # print(f"[SKIP] Decode array detected on object {obj.objid}")
-                    continue
-
-                # 3. Check for Dangerous ColorSpaces
-                # We only touch simple DeviceRGB or DeviceGray.
-                # ICCBased, Indexed, Separation, Lab, CMYK = SKIP.
-                cs = obj.get('/ColorSpace')
-                is_safe_cs = False
-                if cs == pikepdf.Name('/DeviceRGB') or cs == pikepdf.Name('/DeviceGray'):
-                    is_safe_cs = True
-                
-                if not is_safe_cs:
-                    # print(f"[SKIP] Unsafe ColorSpace {cs} on object {obj.objid}")
-                    continue
-
-                # 4. Check for 1-bit or Text Filters
-                # JBIG2/CCITT are for text. Converting to JPEG bloats size and ruins edge sharpness.
-                current_filter = obj.get('/Filter')
-                if current_filter:
-                    filters = current_filter if isinstance(current_filter, list) else [current_filter]
-                    skip_filter = False
-                    for f in filters:
-                        if f in (pikepdf.Name('/CCITTFaxDecode'), pikepdf.Name('/JBIG2Decode'), pikepdf.Name('/JPXDecode')):
-                            skip_filter = True
-                            break
-                    if skip_filter:
-                        # print(f"[SKIP] Text filter detected on object {obj.objid}")
-                        continue
-                
-                if obj.get('/BitsPerComponent') == 1:
-                    # print(f"[SKIP] 1-bit image detected on object {obj.objid}")
-                    continue
-
-                # =========================================================
-                # EXTRACTION & PROCESSING
-                # =========================================================
-
-                img = pil_from_pdfimage(obj)
-                if img is None:
-                    continue
-
-                # 5. Last Line of Defense: PIL Mode Check
-                # If PIL says it's 1-bit, CMYK, or Palette, we bail.
-                if img.mode in ('1', 'CMYK', 'P'):
-                    # print(f"[SKIP] Unsafe PIL Mode {img.mode} on object {obj.objid}")
-                    continue
-                
-                # Check safe modes
-                if img.mode not in ('RGB', 'L'):
-                    continue
-
-                # Capture original size
-                original_compressed_size = get_raw_stream_length(obj)
-
-                # Process Image
-                # Normalize to standard RGB or Grayscale
-                if grayscale:
-                     if img.mode != "L":
-                         new_img = img.convert("L")
-                         new_mode = "DeviceGray"
-                     else:
-                         new_img = img
-                         new_mode = "DeviceGray"
-                else:
-                    if img.mode == "L":
-                        new_img = img
-                        new_mode = "DeviceGray"
-                    else:
-                        new_img = img.convert("RGB")
-                        new_mode = "DeviceRGB"
-
-                if max_dim:
-                    new_img = resize_image(new_img, max_dim)
-
-                # Generate Candidate Stream
-                new_data = None
-                is_lossless = (mode == 'lossless-smart')
-                
-                if is_lossless:
-                     buf = io.BytesIO()
-                     new_img.save(buf, format="PNG", optimize=True)
-                     temp_data = buf.getvalue()
-                     # STRICT Size Check
-                     if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
-                         new_data = temp_data
-                         new_filter = pikepdf.Name("/FlateDecode")
-                else:
-                    q = quality_val
-                    sub = 0 if mode == 'safe' else 2
-                    buf = io.BytesIO()
-                    new_img.save(buf, format="JPEG", quality=q, subsampling=sub, optimize=True)
-                    temp_data = buf.getvalue()
-                    
-                    # STRICT Size Check
-                    if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
-                         new_data = temp_data
-                         new_filter = pikepdf.Name("/DCTDecode")
-
-                # =========================================================
-                # SCORCHED EARTH WRITER
-                # =========================================================
-                
-                if new_data:
-                    # We are replacing the stream. We must PURGE any metadata that might 
-                    # conflict with our new standard JPEG/PNG stream.
-                    
-                    # 1. Update the stream content
-                    obj.write(new_data, filter=new_filter)
-                    
-                    # 2. Define the new Valid Keys
-                    # These are the ONLY keys that should exist for a standard Image XObject
-                    obj["/Type"] = pikepdf.Name("/XObject")
-                    obj["/Subtype"] = pikepdf.Name("/Image")
-                    obj["/Width"] = new_img.width
-                    obj["/Height"] = new_img.height
-                    obj["/ColorSpace"] = pikepdf.Name("/" + new_mode)
-                    obj["/BitsPerComponent"] = 8
-                    obj["/Length"] = len(new_data)
-                    
-                    # 3. NUKE everything else
-                    # We iterate over a copy of keys to avoid modification issues
-                    current_keys = list(obj.keys())
-                    
-                    # Whitelist of keys we explicitly set or allow
-                    whitelist = {
-                        '/Type', '/Subtype', 
-                        '/Width', '/Height', 
-                        '/ColorSpace', '/BitsPerComponent', 
-                        '/Length', '/Filter'
-                    }
-
-                    for k in current_keys:
-                        if k not in whitelist:
-                            # print(f"[CLEAN] Removing key {k} from object {obj.objid}")
-                            del obj[k]
-
-            except Exception as e:
-                # print(f"[ERROR] {e}")
+            if '/Resources' not in page:
                 continue
+
+            # Use generator to find all images on this page (including nested ones)
+            # This logic avoids iterating the entire PDF object tree unnecessarily.
+            for obj in yield_images_from_resources(page['/Resources'], processed_oids):
+                try:
+                    # =========================================================
+                    # THE GATEKEEPER: STRICT SKIP LOGIC
+                    # =========================================================
+
+                    # 1. Check for Masks (Alpha/Stencil/Transparency)
+                    has_mask = False
+                    for k in ['/Mask', '/SMask', '/ImageMask', '/Matte']:
+                        if k in obj:
+                            has_mask = True
+                            break
+                    if has_mask:
+                        continue
+
+                    # 2. Check for Decode Arrays
+                    if '/Decode' in obj:
+                        continue
+
+                    # 3. Check for Dangerous ColorSpaces
+                    cs = obj.get('/ColorSpace')
+                    is_safe_cs = False
+                    if cs == pikepdf.Name('/DeviceRGB') or cs == pikepdf.Name('/DeviceGray'):
+                        is_safe_cs = True
+                    
+                    if not is_safe_cs:
+                        continue
+
+                    # 4. Check for 1-bit or Text Filters
+                    current_filter = obj.get('/Filter')
+                    if current_filter:
+                        filters = current_filter if isinstance(current_filter, list) else [current_filter]
+                        skip_filter = False
+                        for f in filters:
+                            if f in (pikepdf.Name('/CCITTFaxDecode'), pikepdf.Name('/JBIG2Decode'), pikepdf.Name('/JPXDecode')):
+                                skip_filter = True
+                                break
+                        if skip_filter:
+                            continue
+                    
+                    if obj.get('/BitsPerComponent') == 1:
+                        continue
+
+                    # =========================================================
+                    # EXTRACTION & PROCESSING
+                    # =========================================================
+
+                    img = pil_from_pdfimage(obj)
+                    if img is None:
+                        continue
+
+                    # 5. Last Line of Defense: PIL Mode Check
+                    if img.mode in ('1', 'CMYK', 'P'):
+                        continue
+                    
+                    if img.mode not in ('RGB', 'L'):
+                        continue
+
+                    # Capture original size
+                    original_compressed_size = get_raw_stream_length(obj)
+
+                    # Process Image
+                    if grayscale:
+                        if img.mode != "L":
+                            new_img = img.convert("L")
+                            new_mode = "DeviceGray"
+                        else:
+                            new_img = img
+                            new_mode = "DeviceGray"
+                    else:
+                        if img.mode == "L":
+                            new_img = img
+                            new_mode = "DeviceGray"
+                        else:
+                            new_img = img.convert("RGB")
+                            new_mode = "DeviceRGB"
+
+                    if max_dim:
+                        new_img = resize_image(new_img, max_dim)
+
+                    # Generate Candidate Stream
+                    new_data = None
+                    is_lossless = (mode == 'lossless-smart')
+                    
+                    # LOGIC UPDATE: User requested strict size guard.
+                    # Only accept changes (including grayscale conversion) if the file size decreases.
+                    if is_lossless:
+                        buf = io.BytesIO()
+                        new_img.save(buf, format="PNG", optimize=True)
+                        temp_data = buf.getvalue()
+                        
+                        if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
+                            new_data = temp_data
+                            new_filter = pikepdf.Name("/FlateDecode")
+                    else:
+                        q = quality_val
+                        sub = 0 if mode == 'safe' else 2
+                        buf = io.BytesIO()
+                        new_img.save(buf, format="JPEG", quality=q, subsampling=sub, optimize=True)
+                        temp_data = buf.getvalue()
+                        
+                        if original_compressed_size > 0 and len(temp_data) < original_compressed_size:
+                            new_data = temp_data
+                            new_filter = pikepdf.Name("/DCTDecode")
+
+                    # =========================================================
+                    # SCORCHED EARTH WRITER
+                    # =========================================================
+                    
+                    if new_data:
+                        obj.write(new_data, filter=new_filter)
+                        
+                        obj["/Type"] = pikepdf.Name("/XObject")
+                        obj["/Subtype"] = pikepdf.Name("/Image")
+                        obj["/Width"] = new_img.width
+                        obj["/Height"] = new_img.height
+                        obj["/ColorSpace"] = pikepdf.Name("/" + new_mode)
+                        obj["/BitsPerComponent"] = 8
+                        obj["/Length"] = len(new_data)
+                        
+                        current_keys = list(obj.keys())
+                        
+                        whitelist = {
+                            '/Type', '/Subtype', 
+                            '/Width', '/Height', 
+                            '/ColorSpace', '/BitsPerComponent', 
+                            '/Length', '/Filter'
+                        }
+
+                        for k in current_keys:
+                            if k not in whitelist:
+                                del obj[k]
+
+                except Exception as e:
+                    continue
 
         pdf.save(output_path, object_stream_mode=pikepdf.ObjectStreamMode.generate)
         pdf.close()
@@ -346,6 +464,11 @@ def process_pdf_pipeline(args):
 
     except Exception as e:
         return False, f"Error: {e}"
+    finally:
+        # CLEANUP TEMP FILE
+        if temp_cleaned_path and os.path.exists(temp_cleaned_path):
+            try: os.remove(temp_cleaned_path)
+            except: pass
 
 # ----------------------------
 # Threading & UI Logic
@@ -353,7 +476,7 @@ def process_pdf_pipeline(args):
 
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
     # Disable UI
-    for widget in [save_button, batch_button, browse_button]:
+    for widget in [save_button, batch_button, browse_button, paste_button]:
         widget.state(['disabled'])
     
     progress_bar['value'] = 0
@@ -361,6 +484,11 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
 
     quality = int(quality_scale.get()) if compress_var.get() else 100
     grayscale = grayscale_var.get()
+    
+    # Get Watermark Settings
+    wm_text = None
+    if remove_wm_var.get():
+        wm_text = wm_entry.get().strip()
 
     mode_choice = compression_mode_var.get()
     if mode_choice == "Safe Compression": mode = 'safe'
@@ -368,6 +496,12 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     elif mode_choice == "Rasterize (Standard)": mode = 'rasterize'
     elif mode_choice == "Rasterize (B&W Fax Mode)": mode = 'rasterize_fax'
     else: mode = 'lossless-smart'
+
+    # Setup Multiprocessing Queue for granular progress updates
+    use_granular_progress = (len(files_to_process) == 1)
+    
+    manager = multiprocessing.Manager()
+    progress_queue = manager.Queue() if use_granular_progress else None
 
     tasks = []
     for file_path in files_to_process:
@@ -378,7 +512,39 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
             name, ext = os.path.splitext(filename)
             current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
         
-        tasks.append((file_path, current_output, quality, mode, grayscale))
+        # Pass the queue to the worker
+        tasks.append((file_path, current_output, quality, mode, grayscale, wm_text, progress_queue))
+
+    # Polling function for granular progress
+    def poll_queue():
+        if not progress_queue:
+            return
+            
+        try:
+            while True:
+                # Non-blocking check
+                msg = progress_queue.get_nowait()
+                msg_type = msg[0]
+                
+                if msg_type == 'progress':
+                    _, current, total = msg
+                    if total > 0:
+                        percent = (current / total) * 100
+                        progress_bar['value'] = percent
+                        status_label.config(text=f"Processing Page {current}/{total}")
+                elif msg_type == 'status':
+                    _, text, _ = msg
+                    status_label.config(text=text)
+                    
+        except queue.Empty:
+            pass
+            
+        # Reschedule check
+        if save_button.instate(['disabled']): # Stop polling if UI is re-enabled (job done)
+            root.after(100, poll_queue)
+
+    if use_granular_progress:
+        root.after(100, poll_queue)
 
     def run_job():
         success_count = 0
@@ -404,8 +570,12 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
                     errors.append(f"{filename}: Exception: {exc}")
                 
                 completed += 1
-                percentage = (completed / total_files) * 100
-                root.after(0, lambda p=percentage, f=filename: update_ui_progress(p, f))
+                
+                if not use_granular_progress:
+                    percentage = (completed / total_files) * 100
+                    root.after(0, lambda p=percentage, f=filename: update_ui_progress(p, f))
+                else:
+                    root.after(0, lambda f=filename: status_label.config(text=f"Finished: {f}"))
 
         root.after(0, lambda: finish_processing(success_count, total_files, errors))
 
@@ -419,7 +589,7 @@ def finish_processing(success_count, total_count, errors):
     progress_bar['value'] = 100
     status_label.config(text="Processing Complete", foreground="green")
     
-    for widget in [save_button, batch_button, browse_button]:
+    for widget in [save_button, batch_button, browse_button, paste_button]:
         widget.state(['!disabled'])
 
     result_msg = f"Processed {success_count}/{total_count} files successfully."
@@ -440,6 +610,24 @@ def open_file():
         name_root, ext = os.path.splitext(name)
         output_entry.delete(0, tk.END)
         output_entry.insert(0, os.path.join(folder, f"{name_root}_cleaned{ext}"))
+
+def paste_path():
+    try:
+        path = root.clipboard_get()
+        # Clean quotes if present (Windows "Copy as path" adds quotes)
+        path = path.strip().strip('"')
+        if os.path.exists(path) and path.lower().endswith('.pdf'):
+            input_entry.delete(0, tk.END)
+            input_entry.insert(0, path)
+            # Auto-suggest output
+            folder, name = os.path.split(path)
+            name_root, ext = os.path.splitext(name)
+            output_entry.delete(0, tk.END)
+            output_entry.insert(0, os.path.join(folder, f"{name_root}_cleaned{ext}"))
+        else:
+            messagebox.showwarning("Invalid Paste", "Clipboard does not contain a valid PDF path.")
+    except Exception as e:
+        messagebox.showerror("Paste Error", f"Could not paste from clipboard: {e}")
 
 def run_single_file():
     input_path = input_entry.get()
@@ -473,6 +661,12 @@ def toggle_compression():
         compression_mode_dropdown.state(['disabled'])
         grayscale_check.state(['disabled'])
 
+def toggle_watermark():
+    if remove_wm_var.get():
+        wm_entry.state(['!disabled'])
+    else:
+        wm_entry.state(['disabled'])
+
 # ----------------------------
 # GUI Setup
 # ----------------------------
@@ -481,9 +675,9 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
     root = tk.Tk()
-    root.title("CleanPDF (Hybrid) - Fixed")
-    root.geometry("500x550") 
-    root.minsize(500, 550)
+    root.title("CleanPDF (Hybrid) - Enhanced Fax Mode")
+    root.geometry("500x650") 
+    root.minsize(500, 650)
 
     # 1. Styling
     style = ttk.Style()
@@ -525,17 +719,38 @@ if __name__ == "__main__":
     ttk.Label(file_frame, text="Input File:").grid(row=0, column=0, sticky="w", pady=5)
     input_entry = ttk.Entry(file_frame)
     input_entry.grid(row=0, column=1, sticky="ew", padx=5)
+    
+    # Browse Button
     browse_button = ttk.Button(file_frame, text="...", width=4, command=open_file)
-    browse_button.grid(row=0, column=2, sticky="e")
+    browse_button.grid(row=0, column=2, sticky="e", padx=(0, 5))
+
+    # Paste Button
+    paste_button = ttk.Button(file_frame, text="Paste", width=6, command=paste_path)
+    paste_button.grid(row=0, column=3, sticky="e")
 
     # Output
     ttk.Label(file_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=5)
     output_entry = ttk.Entry(file_frame)
-    output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=2)
+    output_entry.grid(row=1, column=1, sticky="ew", padx=5, columnspan=3)
 
     file_frame.columnconfigure(1, weight=1)
 
-    # Section 2: Optimization Settings
+    # Section 2: Watermark Removal (NEW)
+    wm_frame = ttk.LabelFrame(main_container, text="Watermark Removal", padding=(15, 10))
+    wm_frame.pack(fill=tk.X, pady=(0, 15))
+
+    remove_wm_var = tk.BooleanVar(value=False)
+    remove_wm_check = ttk.Checkbutton(wm_frame, text="Remove Specific Text", variable=remove_wm_var, command=toggle_watermark)
+    remove_wm_check.pack(anchor="w", pady=(0, 5))
+
+    wm_inner = ttk.Frame(wm_frame)
+    wm_inner.pack(fill=tk.X)
+    ttk.Label(wm_inner, text="Text to Remove:").pack(side=tk.LEFT)
+    wm_entry = ttk.Entry(wm_inner)
+    wm_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 0))
+    wm_entry.state(['disabled'])
+
+    # Section 3: Optimization Settings
     opt_frame = ttk.LabelFrame(main_container, text="Optimization", padding=(15, 10))
     opt_frame.pack(fill=tk.X, pady=(0, 15))
 
@@ -568,7 +783,7 @@ if __name__ == "__main__":
     grayscale_check = ttk.Checkbutton(settings_inner, text="Convert Images to Grayscale", variable=grayscale_var, state='disabled')
     grayscale_check.pack(anchor="w")
 
-    # Section 3: Actions
+    # Section 4: Actions
     action_frame = ttk.Frame(main_container)
     action_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
