@@ -54,7 +54,8 @@ def remove_text_watermark_fitz(input_path, output_path, text_to_remove):
         return True, found_any
     except Exception as e: return False, str(e)
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, progress_queue=None):
+# MODIFIED: Added threshold parameter
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, threshold=128, progress_queue=None):
     try:
         src_doc = fitz.open(input_pdf_path)
         out_doc = fitz.open()
@@ -76,7 +77,8 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
                 if img.mode != 'L': img = img.convert('L')
                 enhancer = ImageEnhance.Contrast(img)
                 img = enhancer.enhance(2.0)
-                img = img.point(lambda x: 0 if x < 128 else 255, '1')
+                # MODIFIED: Use threshold variable
+                img = img.point(lambda x: 0 if x < threshold else 255, '1')
                 img.save(buf, format="TIFF", compression="group4")
             else:
                 if grayscale: img = img.convert('L')
@@ -115,8 +117,9 @@ def yield_images_from_resources(resources, processed_oids):
                     yield from yield_images_from_resources(xobj['/Resources'], processed_oids)
         except: continue
 
+# MODIFIED: Added threshold to unpacking
 def process_pdf_pipeline(args):
-    input_path, output_path, quality_val, mode, grayscale, watermark_text, progress_queue = args
+    input_path, output_path, quality_val, mode, grayscale, watermark_text, threshold, progress_queue = args
     temp_cleaned_path = None
     try:
         current_input = input_path
@@ -131,7 +134,8 @@ def process_pdf_pipeline(args):
 
         if mode.startswith('rasterize'):
             if progress_queue: progress_queue.put(('status', f"DEBUG: Rasterizing ({mode})...", 0))
-            return rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=(mode == 'rasterize_fax'), progress_queue=progress_queue)
+            # MODIFIED: Pass threshold
+            return rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=(mode == 'rasterize_fax'), threshold=threshold, progress_queue=progress_queue)
 
         if progress_queue: progress_queue.put(('status', "DEBUG: Structural Cleaning...", 0))
         pdf = pikepdf.open(current_input, allow_overwriting_input=True)
@@ -230,11 +234,15 @@ def main():
         enable_wm = st.checkbox("Remove Text")
         wm_text = st.text_input("Text to remove") if enable_wm else ""
         enable_compress = st.checkbox("Enable Compression")
-        mode, quality, grayscale = "safe", 100, False
+        # MODIFIED: Initialized threshold
+        mode, quality, grayscale, threshold = "safe", 100, False, 128
         if enable_compress:
             mode_disp = st.selectbox("Mode", ["Safe Compression", "Aggressive Compression", "Lossless Smart", "Rasterize (Standard)", "Rasterize (B&W Fax Mode)"])
             mode = {"Safe Compression": "safe", "Aggressive Compression": "aggressive", "Lossless Smart": "lossless-smart", "Rasterize (Standard)": "rasterize", "Rasterize (B&W Fax Mode)": "rasterize_fax"}[mode_disp]
             if "Rasterize" in mode_disp or mode_disp in ["Safe Compression", "Aggressive Compression"]: quality = st.slider("Quality", 10, 100, 75)
+            # MODIFIED: Added slider for fax mode
+            if mode == "rasterize_fax":
+                threshold = st.slider("B&W Threshold", 0, 255, 128, help="Sensitivity: Higher = Darker, Lower = Lighter")
             grayscale = st.checkbox("Grayscale")
 
     if st.button("Start", type="primary", disabled=not uploaded_files):
@@ -247,7 +255,8 @@ def main():
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as ti, tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as to:
                 ti.write(up_file.getvalue())
                 input_p, output_p = ti.name, to.name
-            success, msg = process_pdf_pipeline((input_p, output_p, quality, mode, grayscale, wm_text, logger))
+            # MODIFIED: Added threshold to tuple
+            success, msg = process_pdf_pipeline((input_p, output_p, quality, mode, grayscale, wm_text, threshold, logger))
             if success:
                 with open(output_p, "rb") as f: results.append({"name": f"clean_{up_file.name}", "data": f.read()})
                 logger.put(('status', f"Done: {up_file.name}", 0))
