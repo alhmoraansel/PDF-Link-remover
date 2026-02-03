@@ -9,7 +9,7 @@ import fitz  # PyMuPDF
 import pikepdf
 from pikepdf.models.image import PdfImage
 from pikepdf import Name, Dictionary, Array
-from PIL import Image
+from PIL import Image, ImageEnhance
 import concurrent.futures
 import multiprocessing
 import queue
@@ -95,7 +95,7 @@ def flatten_alpha(pil_img, background_color=(255,255,255)):
 # Rasterization Logic
 # ----------------------------
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, progress_queue=None):
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, threshold=200, enhance_factor=1.0, progress_queue=None):
     try:
         src_doc = fitz.open(input_pdf_path)
         out_doc = fitz.open()
@@ -116,10 +116,25 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
             if pix.n == 1: mode = "L"
             elif pix.n == 4: mode = "CMYK"
             img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+            
+            # Apply Enhancement (Contrast + Saturation)
+            if enhance_factor != 1.0:
+                if img.mode not in ('RGB', 'RGBA'):
+                    img = img.convert('RGB')
+                
+                # 1. Contrast (Make darks darker/pronounced)
+                enhancer_c = ImageEnhance.Contrast(img)
+                img = enhancer_c.enhance(enhance_factor)
+                
+                # 2. Color (Make colors pop)
+                enhancer_s = ImageEnhance.Color(img)
+                img = enhancer_s.enhance(enhance_factor)
+
             buf = io.BytesIO()
 
             if fax_mode:
-                img = img.convert('L').point(lambda x: 0 if x < 200 else 255, '1')
+                # Use dynamic threshold for B&W conversion
+                img = img.convert('L').point(lambda x: 0 if x < threshold else 255, '1')
                 img.save(buf, format="TIFF", compression="group4")
             else:
                 if grayscale: img = img.convert('L')
@@ -150,7 +165,7 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
 # ----------------------------
 
 def process_pdf_pipeline(args):
-    input_path, output_path, watermark_text, quality_val, mode, grayscale, progress_queue = args
+    input_path, output_path, watermark_text, quality_val, mode, grayscale, threshold, enhance_factor, progress_queue = args
     
     fd1, temp_repaired = tempfile.mkstemp(suffix="_repaired.pdf")
     os.close(fd1)
@@ -202,7 +217,7 @@ def process_pdf_pipeline(args):
 
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
-            success, msg = rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=is_fax, progress_queue=progress_queue)
+            success, msg = rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=is_fax, threshold=threshold, enhance_factor=enhance_factor, progress_queue=progress_queue)
             return success, msg
 
         try:
@@ -231,6 +246,19 @@ def process_pdf_pipeline(args):
                         pil_img = pil_from_pdfimage(pdf_img)
                         if pil_img is None: continue
                     except: continue
+
+                    # Apply Enhancement (Contrast + Saturation)
+                    if enhance_factor != 1.0:
+                        if pil_img.mode not in ('RGB', 'RGBA'):
+                            pil_img = pil_img.convert('RGB')
+                        
+                        # 1. Contrast
+                        enhancer_c = ImageEnhance.Contrast(pil_img)
+                        pil_img = enhancer_c.enhance(enhance_factor)
+                        
+                        # 2. Color
+                        enhancer_s = ImageEnhance.Color(pil_img)
+                        pil_img = enhancer_s.enhance(enhance_factor)
 
                     original_size = get_raw_stream_length(obj)
                     if grayscale and pil_img.mode != 'L': pil_img = pil_img.convert('L')
@@ -310,6 +338,11 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     status_label.config(text="Initializing engine...", foreground="#2563eb")
 
     quality = int(quality_scale.get()) if compress_var.get() else 100
+    # Get threshold value
+    bw_thresh = int(bw_threshold_scale.get())
+    # Get color enhance factor
+    enhance_factor = float(color_enhance_scale.get())
+    
     grayscale = grayscale_var.get()
     wm_text = watermark_entry.get().strip()
 
@@ -332,7 +365,8 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
             name, ext = os.path.splitext(filename)
             current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
         
-        tasks.append((file_path, current_output, wm_text, quality, mode, grayscale, progress_queue))
+        # Pass bw_thresh and enhance_factor in arguments
+        tasks.append((file_path, current_output, wm_text, quality, mode, grayscale, bw_thresh, enhance_factor, progress_queue))
 
     def poll_queue():
         try:
@@ -394,9 +428,8 @@ def finish_processing(success_count, total_count, errors):
     result_msg = f"Processed {success_count}/{total_count} files successfully."
     if errors:
         result_msg += "\n\nErrors:\n" + "\n".join(errors)
-        messagebox.showwarning("Completed with Issues", result_msg)
     else:
-        messagebox.showinfo("Success", result_msg)
+        pass
 
 # --- UI Action Functions ---
 
@@ -464,16 +497,31 @@ def run_batch():
 def update_scale_label(val):
     quality_label_var.set(f"Quality: {int(float(val))}%")
 
-def toggle_compression():
+def update_bw_label(val):
+    bw_threshold_label_var.set(f"B&W Threshold: {int(float(val))}")
+
+def update_enhance_label(val):
+    color_enhance_label_var.set(f"Enhancement: {float(val):.1f}x")
+
+def toggle_compression(event=None):
     if compress_var.get():
         quality_scale.state(['!disabled'])
         compression_mode_dropdown.state(['!disabled'])
         compression_mode_dropdown.config(state="readonly")
         grayscale_check.state(['!disabled'])
+        color_enhance_scale.state(['!disabled'])
+        
+        # Check specific mode for B&W slider
+        if compression_mode_var.get() == "Rasterize (B&W Fax Mode)":
+             bw_threshold_scale.state(['!disabled'])
+        else:
+             bw_threshold_scale.state(['disabled'])
     else:
         quality_scale.state(['disabled'])
         compression_mode_dropdown.state(['disabled'])
         grayscale_check.state(['disabled'])
+        bw_threshold_scale.state(['disabled'])
+        color_enhance_scale.state(['disabled'])
 
 # ----------------------------
 # GUI Setup
@@ -484,15 +532,13 @@ if __name__ == "__main__":
 
     root = tk.Tk()
     root.title("CleanPDF Mini")
-    root.geometry("450x480") 
-    root.minsize(400, 430)
+    root.geometry("450x600") # Increased height for new slider
+    root.minsize(400, 520)
     
-    # --- NEW: SET ICON ---
-    # Make sure you have a file named 'app.ico' in the same folder
     try:
         root.iconbitmap(resource_path("app.ico"))
     except Exception:
-        pass # Fallback if icon missing
+        pass 
     
     # Internal variables
     full_input_path = tk.StringVar()
@@ -587,7 +633,7 @@ if __name__ == "__main__":
     opt_frame = ttk.LabelFrame(main_container, text=" Settings ", padding=(10, 8), style="Card.TLabelframe")
     opt_frame.pack(fill=tk.BOTH, expand=True, side=tk.TOP)
 
-    compress_var = tk.BooleanVar(value=False)
+    compress_var = tk.BooleanVar(value=True)
     compress_check = ttk.Checkbutton(opt_frame, text="Enable Advanced Compression", variable=compress_var, command=toggle_compression, style="Switch.TCheckbutton")
     compress_check.pack(anchor="w", pady=(0, 5))
     
@@ -597,7 +643,7 @@ if __name__ == "__main__":
     settings_inner.pack(fill=tk.X)
 
     ttk.Label(settings_inner, text="Mode:", background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
-    compression_mode_var = tk.StringVar(value="Safe Compression")
+    compression_mode_var = tk.StringVar(value="Rasterize (B&W Fax Mode)")
     compression_mode_dropdown = ttk.Combobox(settings_inner, textvariable=compression_mode_var, state="disabled",
                                              values=[
                                                  "Safe Compression", 
@@ -607,17 +653,40 @@ if __name__ == "__main__":
                                                  "Rasterize (B&W Fax Mode)"
                                              ], font=("Segoe UI", 9))
     compression_mode_dropdown.pack(fill=tk.X, pady=(0, 8))
+    compression_mode_dropdown.bind("<<ComboboxSelected>>", toggle_compression)
 
-    quality_label_var = tk.StringVar(value="Quality: 75%")
+    # Quality Slider
+    quality_label_var = tk.StringVar(value="Quality: 10%")
     ttk.Label(settings_inner, textvariable=quality_label_var, background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
     
     quality_scale = ttk.Scale(settings_inner, from_=10, to=100, orient="horizontal", command=update_scale_label)
-    quality_scale.set(75)
+    quality_scale.set(10)
     quality_scale.pack(fill=tk.X, pady=(0, 8))
     quality_scale.state(['disabled'])
+
+    # B&W Threshold Slider
+    bw_threshold_label_var = tk.StringVar(value="B&W Threshold: 235")
+    ttk.Label(settings_inner, textvariable=bw_threshold_label_var, background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
+
+    bw_threshold_scale = ttk.Scale(settings_inner, from_=0, to=255, orient="horizontal", command=update_bw_label)
+    bw_threshold_scale.set(235)
+    bw_threshold_scale.pack(fill=tk.X, pady=(0, 8))
+    bw_threshold_scale.state(['disabled'])
+
+    # NEW: Color Enhancement Slider
+    color_enhance_label_var = tk.StringVar(value="Enhancement: 3.0x")
+    ttk.Label(settings_inner, textvariable=color_enhance_label_var, background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
+
+    color_enhance_scale = ttk.Scale(settings_inner, from_=0.0, to=5.0, orient="horizontal", command=update_enhance_label)
+    color_enhance_scale.set(3.0)
+    color_enhance_scale.pack(fill=tk.X, pady=(0, 8))
+    color_enhance_scale.state(['disabled'])
 
     grayscale_var = tk.BooleanVar(value=False)
     grayscale_check = ttk.Checkbutton(settings_inner, text="Grayscale", variable=grayscale_var, state='disabled')
     grayscale_check.pack(anchor="w")
+
+    # Sync UI with default True state
+    toggle_compression()
 
     root.mainloop()
