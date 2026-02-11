@@ -665,20 +665,20 @@ if __name__ == "__main__":
     quality_scale.state(['disabled'])
 
     # B&W Threshold Slider
-    bw_threshold_label_var = tk.StringVar(value="B&W Threshold: 235")
+    bw_threshold_label_var = tk.StringVar(value="B&W Threshold: 120")
     ttk.Label(settings_inner, textvariable=bw_threshold_label_var, background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
 
     bw_threshold_scale = ttk.Scale(settings_inner, from_=0, to=255, orient="horizontal", command=update_bw_label)
-    bw_threshold_scale.set(235)
+    bw_threshold_scale.set(120)
     bw_threshold_scale.pack(fill=tk.X, pady=(0, 8))
     bw_threshold_scale.state(['disabled'])
 
     # NEW: Color Enhancement Slider
-    color_enhance_label_var = tk.StringVar(value="Enhancement: 3.0x")
+    color_enhance_label_var = tk.StringVar(value="Enhancement: 5.0x")
     ttk.Label(settings_inner, textvariable=color_enhance_label_var, background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
 
     color_enhance_scale = ttk.Scale(settings_inner, from_=0.0, to=5.0, orient="horizontal", command=update_enhance_label)
-    color_enhance_scale.set(3.0)
+    color_enhance_scale.set(5.0)
     color_enhance_scale.pack(fill=tk.X, pady=(0, 8))
     color_enhance_scale.state(['disabled'])
 
