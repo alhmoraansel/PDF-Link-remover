@@ -1,0 +1,1 @@
+pyinstaller --name "Clean PDF" --windowed --icon "icon.ico" --add-data "icon.ico;." watermark_remover_hc.py

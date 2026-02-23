@@ -92,10 +92,16 @@ def flatten_alpha(pil_img, background_color=(255,255,255)):
     return pil_img
 
 # ----------------------------
+# Globals for Stop Logic
+# ----------------------------
+is_processing = False
+global_cancel_event = None
+
+# ----------------------------
 # Rasterization Logic
 # ----------------------------
 
-def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, threshold=200, enhance_factor=1.0, progress_queue=None):
+def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=False, fax_mode=False, threshold=200, enhance_factor=1.0, progress_queue=None, cancel_event=None):
     try:
         src_doc = fitz.open(input_pdf_path)
         out_doc = fitz.open()
@@ -109,6 +115,7 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
         total_pages = len(src_doc)
 
         for i, page in enumerate(src_doc):
+            if cancel_event and cancel_event.is_set(): raise Exception("Cancelled by user")
             if progress_queue: progress_queue.put(('progress', i + 1, total_pages))
 
             pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -165,7 +172,7 @@ def rasterize_and_rebuild(input_pdf_path, output_pdf_path, quality, grayscale=Fa
 # ----------------------------
 
 def process_pdf_pipeline(args):
-    input_path, output_path, watermark_text, quality_val, mode, grayscale, threshold, enhance_factor, progress_queue = args
+    input_path, output_path, watermark_text, quality_val, mode, grayscale, threshold, enhance_factor, progress_queue, cancel_event = args
     
     fd1, temp_repaired = tempfile.mkstemp(suffix="_repaired.pdf")
     os.close(fd1)
@@ -189,9 +196,11 @@ def process_pdf_pipeline(args):
             phrases = [p.strip() for p in watermark_text.split(',')] if watermark_text and watermark_text.strip() else []
 
             for i, page in enumerate(doc):
-                try:
-                    for link in page.get_links(): page.delete_link(link)
-                except: pass
+                if cancel_event.is_set(): raise Exception("Cancelled by user")
+                if mode != 'split_links_content':
+                    try:
+                        for link in page.get_links(): page.delete_link(link)
+                    except: pass
                 try:
                     for annot in list(page.annots()):
                         if annot.type[0] == 1: page.delete_annot(annot)
@@ -215,11 +224,88 @@ def process_pdf_pipeline(args):
         
         if progress_queue: progress_queue.put(('status', "Step 3/3: Optimizing...", 0))
 
+        # --- NEW MODE: SPLIT CONTENT AND LINKS ---
+        if mode == 'split_links_content':
+            if progress_queue: progress_queue.put(('status', "Step 3/3: Splitting Content, Links & Remaining...", 0))
+            try:
+                src_doc = fitz.open(current_input)
+                content_doc = fitz.open()
+                links_doc = fitz.open()
+                remaining_doc = fitz.open()
+
+                # Derive the new filenames based on the input filename
+                dir_name = os.path.dirname(output_path)
+                base_in = os.path.splitext(os.path.basename(input_path))[0]
+                content_out = os.path.join(dir_name, f"{base_in}_content.pdf")
+                links_out = os.path.join(dir_name, f"{base_in}_linksonly.pdf")
+                remaining_out = os.path.join(dir_name, f"{base_in}_remaining.pdf")
+
+                total_pages = len(src_doc)
+                for i in range(total_pages):
+                    if cancel_event.is_set(): raise Exception("Cancelled by user")
+                    if progress_queue: progress_queue.put(('progress', i + 1, total_pages))
+                    
+                    src_page = src_doc[i]
+                    
+                    # 1. Links Only (Blank page, just add the links)
+                    link_page = links_doc.new_page(width=src_page.rect.width, height=src_page.rect.height)
+                    for link in src_page.get_links():
+                        link_page.insert_link(link)
+                    
+                    # 2. Content Only (Deep copy, strip links natively)
+                    content_doc.insert_pdf(src_doc, from_page=i, to_page=i, links=False, annots=False)
+                    page = content_doc[-1] 
+                    
+                    # 3. Remaining Items (Blank page for background images)
+                    rem_page = remaining_doc.new_page(width=src_page.rect.width, height=src_page.rect.height)
+                    
+                    # Safely extract large background images to remaining_doc, then mask them out in content_doc
+                    page_area = page.rect.width * page.rect.height
+                    try:
+                        for img in page.get_image_info(xrefs=True):
+                            bbox = fitz.Rect(img["bbox"])
+                            if (bbox.width * bbox.height) > (page_area * 0.4):
+                                xref = img.get("xref", 0)
+                                if xref > 0:
+                                    # First, copy the extracted image to the remaining_doc
+                                    try:
+                                        img_dict = content_doc.extract_image(xref)
+                                        rem_page.insert_image(bbox, stream=img_dict["image"])
+                                    except:
+                                        pass
+                                    
+                                    # Then, blank it out in content_doc
+                                    content_doc.xref_set_key(xref, "Filter", "null")
+                                    content_doc.xref_set_key(xref, "ColorSpace", "/DeviceGray")
+                                    content_doc.xref_set_key(xref, "BitsPerComponent", "8")
+                                    content_doc.xref_set_key(xref, "Width", "1")
+                                    content_doc.xref_set_key(xref, "Height", "1")
+                                    content_doc.xref_set_key(xref, "Mask", "null")
+                                    content_doc.xref_set_key(xref, "SMask", "null")
+                                    content_doc.xref_set_key(xref, "Decode", "null")
+                                    content_doc.update_stream(xref, b"\xff") # 1 byte of solid white
+                    except:
+                        pass
+                
+                content_doc.save(content_out, garbage=4, deflate=True)
+                links_doc.save(links_out, garbage=4, deflate=True)
+                remaining_doc.save(remaining_out, garbage=4, deflate=True)
+                
+                src_doc.close()
+                content_doc.close()
+                links_doc.close()
+                remaining_doc.close()
+                return True, "Success: Created _content, _linksonly, and _remaining PDFs."
+            except Exception as e:
+                return False, f"Error during split: {e}"
+
+        # --- Rasterize Modes ---
         if mode.startswith('rasterize'):
             is_fax = (mode == 'rasterize_fax')
-            success, msg = rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=is_fax, threshold=threshold, enhance_factor=enhance_factor, progress_queue=progress_queue)
+            success, msg = rasterize_and_rebuild(current_input, output_path, quality_val, grayscale, fax_mode=is_fax, threshold=threshold, enhance_factor=enhance_factor, progress_queue=progress_queue, cancel_event=cancel_event)
             return success, msg
 
+        # --- Standard Pikepdf Iterative Compression ---
         try:
             pdf = pikepdf.open(current_input, allow_overwriting_input=True)
             pdf.docinfo.clear()
@@ -231,6 +317,7 @@ def process_pdf_pipeline(args):
             all_objects = list(pdf.objects)
             
             for idx, obj in enumerate(all_objects):
+                if cancel_event.is_set(): raise Exception("Cancelled by user")
                 if idx % 100 == 0 and progress_queue: # OPTIMIZATION: Update UI less frequently to save CPU
                     progress_queue.put(('status', f"Optimizing Object {idx}/{len(all_objects)}...", 0))
 
@@ -326,10 +413,46 @@ def process_pdf_pipeline(args):
 # Threading & UI Logic
 # ----------------------------
 
+def disable_close_button():
+    try:
+        import ctypes
+        hwnd = int(root.wm_frame(), 16)
+        menu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+        ctypes.windll.user32.EnableMenuItem(menu, 0xF060, 1) # SC_CLOSE, MF_GRAYED
+    except: pass
+
+def enable_close_button():
+    try:
+        import ctypes
+        hwnd = int(root.wm_frame(), 16)
+        menu = ctypes.windll.user32.GetSystemMenu(hwnd, False)
+        ctypes.windll.user32.EnableMenuItem(menu, 0xF060, 0) # SC_CLOSE, MF_ENABLED
+    except: pass
+
+def on_closing():
+    if is_processing:
+        return # Ignore close requests during processing
+    root.destroy()
+
+def stop_processing():
+    if global_cancel_event:
+        global_cancel_event.set()
+        status_label.config(text="Cancelling... Please wait.", foreground="#ef4444")
+        stop_button.state(['disabled'])
+
 def start_processing_thread(files_to_process, output_dir=None, single_output=None):
+    global is_processing, global_cancel_event
+    is_processing = True
+    disable_close_button()
+
     # Disable UI
-    for widget in [save_button, batch_button, browse_button, paste_wm_button]:
+    for widget in [browse_button, paste_wm_button]:
         widget.state(['disabled'])
+        
+    save_button.pack_forget()
+    batch_button.pack_forget()
+    stop_button.pack(fill=tk.X, expand=True)
+    stop_button.state(['!disabled'])
     
     # Disable output entry field
     output_entry.config(state='disabled')
@@ -351,9 +474,11 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     elif mode_choice == "Aggressive Compression": mode = 'aggressive'
     elif mode_choice == "Rasterize (Standard)": mode = 'rasterize'
     elif mode_choice == "Rasterize (B&W Fax Mode)": mode = 'rasterize_fax'
+    elif mode_choice == "Split (Content, Links, Remaining)": mode = 'split_links_content'
     else: mode = 'lossless-smart'
 
     manager = multiprocessing.Manager()
+    global_cancel_event = manager.Event()
     progress_queue = manager.Queue()
 
     tasks = []
@@ -366,7 +491,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
             current_output = os.path.join(output_dir, f"{name}_cleaned{ext}")
         
         # Pass bw_thresh and enhance_factor in arguments
-        tasks.append((file_path, current_output, wm_text, quality, mode, grayscale, bw_thresh, enhance_factor, progress_queue))
+        tasks.append((file_path, current_output, wm_text, quality, mode, grayscale, bw_thresh, enhance_factor, progress_queue, global_cancel_event))
 
     def poll_queue():
         try:
@@ -384,7 +509,7 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
                     status_label.config(text=text)
         except queue.Empty: pass
             
-        if save_button.instate(['disabled']):
+        if is_processing:
             root.after(100, poll_queue)
 
     root.after(100, poll_queue)
@@ -417,13 +542,27 @@ def start_processing_thread(files_to_process, output_dir=None, single_output=Non
     threading.Thread(target=run_job, daemon=True).start()
 
 def finish_processing(success_count, total_count, errors):
+    global is_processing
+    is_processing = False
+    enable_close_button()
+    
     progress_bar['value'] = 100
-    status_label.config(text="Processing Complete", foreground="#10b981")
+    
+    stop_button.pack_forget()
+    save_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+    batch_button.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(5, 0))
+
     for widget in [save_button, batch_button, browse_button, paste_wm_button]:
         widget.state(['!disabled'])
     
     # Re-enable output entry field
     output_entry.config(state='normal')
+
+    if global_cancel_event and global_cancel_event.is_set():
+        status_label.config(text="Processing Cancelled", foreground="#ef4444")
+        return
+        
+    status_label.config(text="Processing Complete", foreground="#10b981")
     
     result_msg = f"Processed {success_count}/{total_count} files successfully."
     if errors:
@@ -511,11 +650,22 @@ def toggle_compression(event=None):
         grayscale_check.state(['!disabled'])
         color_enhance_scale.state(['!disabled'])
         
+        mode = compression_mode_var.get()
         # Check specific mode for B&W slider
-        if compression_mode_var.get() == "Rasterize (B&W Fax Mode)":
+        if mode == "Rasterize (B&W Fax Mode)":
              bw_threshold_scale.state(['!disabled'])
         else:
              bw_threshold_scale.state(['disabled'])
+             
+        # Disable irrelevant sliders for Rebuild mode
+        if mode == "Split (Content, Links, Remaining)":
+             quality_scale.state(['disabled'])
+             color_enhance_scale.state(['disabled'])
+             grayscale_check.state(['disabled'])
+        else:
+             quality_scale.state(['!disabled'])
+             color_enhance_scale.state(['!disabled'])
+             grayscale_check.state(['!disabled'])
     else:
         quality_scale.state(['disabled'])
         compression_mode_dropdown.state(['disabled'])
@@ -530,13 +680,26 @@ def toggle_compression(event=None):
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
+    # --- Windows Taskbar Icon Fix ---
+    # This forces Windows to show the custom icon on the taskbar instead of the default Tkinter feather
+    try:
+        import ctypes
+        myappid = 'custom.cleanpdf.mini.1' # arbitrary string
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass
+
     root = tk.Tk()
     root.title("CleanPDF Mini")
     root.geometry("450x600") # Increased height for new slider
     root.minsize(400, 520)
     
+    # Intercept close window event
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
     try:
-        root.iconbitmap(resource_path("app.ico"))
+        # Changed from app.ico to icon.ico to match the PyInstaller command
+        root.iconbitmap(resource_path("icon.ico"))
     except Exception:
         pass 
     
@@ -568,6 +731,9 @@ if __name__ == "__main__":
     style.configure("Accent.TButton", background=ACCENT, foreground="white", font=("Segoe UI", 9, "bold"), borderwidth=0)
     style.map("Accent.TButton", background=[('active', ACCENT_HOVER)])
 
+    style.configure("Stop.TButton", background="#ef4444", foreground="white", font=("Segoe UI", 9, "bold"), borderwidth=0)
+    style.map("Stop.TButton", background=[('active', '#dc2626')])
+
     style.configure("Modern.TEntry", fieldbackground=BG_MAIN, bordercolor=BORDER, padding=3)
     style.configure("Horizontal.TProgressbar", thickness=10, background=ACCENT, troughcolor="#e5e7eb", bordercolor=BG_MAIN)
 
@@ -586,6 +752,9 @@ if __name__ == "__main__":
 
     btn_grid = ttk.Frame(action_frame)
     btn_grid.pack(fill=tk.X)
+
+    # Stop button (Hidden by default)
+    stop_button = ttk.Button(btn_grid, text="STOP", style="Stop.TButton", command=stop_processing)
 
     save_button = ttk.Button(btn_grid, text="PROCESS ONE", style="Accent.TButton", command=run_single_file)
     save_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
@@ -643,14 +812,15 @@ if __name__ == "__main__":
     settings_inner.pack(fill=tk.X)
 
     ttk.Label(settings_inner, text="Mode:", background=BG_CARD, foreground=TEXT_SUB, font=("Segoe UI", 8)).pack(anchor="w")
-    compression_mode_var = tk.StringVar(value="Rasterize (B&W Fax Mode)")
+    compression_mode_var = tk.StringVar(value="Split (Content, Links, Remaining)")
     compression_mode_dropdown = ttk.Combobox(settings_inner, textvariable=compression_mode_var, state="disabled",
                                              values=[
                                                  "Safe Compression", 
                                                  "Aggressive Compression", 
                                                  "Lossless Smart",
                                                  "Rasterize (Standard)",
-                                                 "Rasterize (B&W Fax Mode)"
+                                                 "Rasterize (B&W Fax Mode)",
+                                                 "Split (Content, Links, Remaining)"
                                              ], font=("Segoe UI", 9))
     compression_mode_dropdown.pack(fill=tk.X, pady=(0, 8))
     compression_mode_dropdown.bind("<<ComboboxSelected>>", toggle_compression)
